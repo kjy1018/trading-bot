@@ -1,0 +1,30 @@
+Render.com Background Worker 배포 가이드
+
+1) 배포 진입점
+- Start Command: python scheduler.py
+
+2) 빌드 명령
+- Build Command: pip install -r requirements.txt
+
+3) 의존성 파일
+- requirements.txt 사용 (현재 프로젝트 기준):
+  - requests
+  - pandas
+  - streamlit
+  - streamlit-autorefresh
+  - websocket-client
+  - discord.py
+
+4) 권장 설정
+- Service Type: Background Worker
+- Runtime: Python
+- 루트 경로: 저장소 루트 (scheduler.py가 있는 위치)
+
+5) 환경 변수(대시보드에 등록)
+- APP_KEY
+- APP_SECRET
+- ACCOUNT_NO
+- ACCOUNT_PROD_CODE
+- DISCORD_BOT_TOKEN
+- DISCORD_CHANNEL_ID
+- (선택) GEMINI_API_KEY

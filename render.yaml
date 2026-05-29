@@ -1,0 +1,7 @@
+services:
+  - type: worker
+    name: mirae-bot-worker
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scheduler.py

@@ -1,0 +1,88 @@
+{
+  "daily": {
+    "date": "2026-05-29",
+    "pct_low": -0.13,
+    "pct_high": 2.87,
+    "pct_mid": 1.37,
+    "narrative": "🧠 슬롯 AI (4종 · 장투6400, 장투6570, 스윙1190, 단타1270) → 당일 기대 -0.1~+2.9% (등록 종목·모드·목표가 연동)",
+    "slot_count": 4,
+    "source": "commander_slots",
+    "updated_at": "2026-05-29 17:55:05"
+  },
+  "weekly": {
+    "week_start": "2026-05-25",
+    "pct_low": 6.0,
+    "pct_high": 11.0,
+    "pct_mid": 8.5,
+    "narrative": "🧠 주간 AI 가이드: 코스닥 bullish, 스페이스X IPO·우주항공 테마 · 코스닥 밸류업·정책 모멘텀 → 주간 종합 기대 +6.0~+11.0%",
+    "macro_events": [
+      {
+        "title": "스페이스X IPO·우주항공 테마",
+        "impact": "bullish",
+        "note": "우주항공·방산 밸류체인 수급 기대"
+      },
+      {
+        "title": "코스닥 밸류업·정책 모멘텀",
+        "impact": "bullish",
+        "note": "중소형 성장주 순환매"
+      },
+      {
+        "title": "금리·환율 변동성",
+        "impact": "bearish",
+        "note": "리스크오프 시 단타 비중 확대"
+      }
+    ],
+    "kosdaq_trend": "bullish",
+    "updated_at": "2026-05-29 17:55:13"
+  },
+  "allocation": {
+    "scalp_weight": 0.25,
+    "swing_weight": 0.4,
+    "long_weight": 0.35,
+    "updated_at": "2026-05-29 17:55:13"
+  },
+  "ai_forecast": {
+    "daily": {
+      "date": "2026-05-29",
+      "pct_low": -0.13,
+      "pct_high": 2.87,
+      "pct_mid": 1.37,
+      "narrative": "🧠 슬롯 AI (4종 · 장투6400, 장투6570, 스윙1190, 단타1270) → 당일 기대 -0.1~+2.9% (등록 종목·모드·목표가 연동)",
+      "slot_count": 4,
+      "source": "commander_slots",
+      "updated_at": "2026-05-29 18:03:01"
+    },
+    "weekly": {
+      "week_start": "2026-05-25",
+      "pct_low": 6.0,
+      "pct_high": 11.0,
+      "pct_mid": 8.5,
+      "narrative": "🧠 주간 AI 가이드: 코스닥 bullish, 스페이스X IPO·우주항공 테마 · 코스닥 밸류업·정책 모멘텀 → 주간 종합 기대 +6.0~+11.0%",
+      "macro_events": [
+        {
+          "title": "스페이스X IPO·우주항공 테마",
+          "impact": "bullish",
+          "note": "우주항공·방산 밸류체인 수급 기대"
+        },
+        {
+          "title": "코스닥 밸류업·정책 모멘텀",
+          "impact": "bullish",
+          "note": "중소형 성장주 순환매"
+        },
+        {
+          "title": "금리·환율 변동성",
+          "impact": "bearish",
+          "note": "리스크오프 시 단타 비중 확대"
+        }
+      ],
+      "kosdaq_trend": "bullish",
+      "updated_at": "2026-05-29 18:03:10"
+    },
+    "allocation": {
+      "scalp_weight": 0.25,
+      "swing_weight": 0.4,
+      "long_weight": 0.35,
+      "updated_at": "2026-05-29 18:03:10"
+    }
+  }
+}
