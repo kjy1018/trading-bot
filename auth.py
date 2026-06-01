@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 
@@ -32,6 +33,7 @@ TOKEN_CACHE_NAMES = (
 )
 
 _last_token_issue_monotonic: float = 0.0
+_token_lock = threading.Lock()
 
 
 class KISTokenForbiddenError(RuntimeError):
@@ -213,25 +215,39 @@ def invalidate_access_token() -> None:
         logger.info("토큰 캐시 삭제: %s", deleted)
 
 
+def format_token_error(exc: BaseException) -> str:
+    """Render 로그용 — HTTPError 대신 KIS 코드/메시지 우선 표시."""
+    if isinstance(exc, (KISTokenRateLimitError, KISTokenForbiddenError)):
+        return str(exc)
+    resp = getattr(exc, "response", None)
+    if resp is not None and is_forbidden_status(getattr(resp, "status_code", None)):
+        _, detail = _parse_token_error_response(resp)
+        if detail:
+            return detail
+    return str(exc)
+
+
 def get_access_token(force_refresh: bool = False) -> str:
     """
     접근 토큰 반환.
     - 유효한 token.json 있으면 재사용
     - force_refresh=True: 신규 발급 시도 (성공 시 덮어쓰기, EGW00133이면 캐시 유지)
+    - 동시 호출 시 Lock으로 1분당 1회 제한(EGW00133) 방지
     """
-    if not force_refresh:
-        cached = _load_cached_token()
-        if cached:
-            return cached
+    with _token_lock:
+        if not force_refresh:
+            cached = _load_cached_token()
+            if cached:
+                return cached
 
-    cached_before = _load_cached_token()
-    try:
-        return _request_new_token()
-    except KISTokenRateLimitError:
-        if cached_before:
-            logger.warning("발급 제한 — 직전 캐시 토큰으로 폴백")
-            return cached_before
-        raise
+        cached_before = _load_cached_token()
+        try:
+            return _request_new_token()
+        except KISTokenRateLimitError:
+            if cached_before:
+                logger.warning("발급 제한 — 직전 캐시 토큰으로 폴백")
+                return cached_before
+            raise
 
 
 def refresh_access_token_after_forbidden() -> str:
@@ -239,16 +255,17 @@ def refresh_access_token_after_forbidden() -> str:
     API 호출 403(토큰 만료 등) 시 — 캐시 삭제 없이 신규 발급 시도.
     EGW00133이면 기존 캐시를 우선 사용합니다.
     """
-    cached = _load_cached_token()
-    try:
-        return _request_new_token()
-    except KISTokenRateLimitError:
-        if cached:
-            return cached
-        raise
-    except KISTokenForbiddenError:
-        invalidate_access_token()
-        return _request_new_token()
+    with _token_lock:
+        cached = _load_cached_token()
+        try:
+            return _request_new_token()
+        except KISTokenRateLimitError:
+            if cached:
+                return cached
+            raise
+        except KISTokenForbiddenError:
+            invalidate_access_token()
+            return _request_new_token()
 
 
 if __name__ == "__main__":

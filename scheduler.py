@@ -968,7 +968,11 @@ def _maybe_preopen_session_boot(now_dt: datetime) -> None:
         _last_preopen_boot_date = today
         logger.info("08:30 사전 세션 갱신 완료")
     except Exception as exc:
-        logger.warning("08:30 사전 세션 갱신 실패: %s", exc)
+        from auth import format_token_error
+
+        logger.warning(
+            "08:30 사전 세션 갱신 실패: %s", format_token_error(exc)
+        )
 
 
 def _reset_daily_stats_if_needed() -> None:
@@ -3090,6 +3094,18 @@ if __name__ == "__main__":
 
     try:
         print("🚀 scheduler.py 단독 실행 시작", flush=True)
+        if not str(getattr(config, "APP_KEY", "") or "").strip():
+            print(
+                "🚨 APP_KEY 가 비어 있습니다. Render Dashboard → Environment 에 "
+                "APP_KEY / APP_SECRET 를 등록하세요.",
+                flush=True,
+            )
+        elif not str(getattr(config, "APP_SECRET", "") or "").strip():
+            print(
+                "🚨 APP_SECRET 가 비어 있습니다. Render Dashboard → Environment 에 "
+                "APP_SECRET 를 등록하세요.",
+                flush=True,
+            )
         # KIS 연결 사전 점검: 인증/계좌/응답 메시지를 터미널에 강제 노출.
         try:
             token = get_access_token()
@@ -3104,7 +3120,9 @@ if __name__ == "__main__":
             if snap.get("message"):
                 print(f"ℹ️ KIS 응답 메시지: {snap.get('message')}")
         except Exception as e:
-            print(f"🚨 [치명적 에러 발생]: {e}")
+            from auth import format_token_error
+
+            print(f"🚨 [치명적 에러 발생]: {format_token_error(e)}", flush=True)
             print("🚨 [KIS 연결 실패 상세]")
             traceback.print_exc()
             raise
