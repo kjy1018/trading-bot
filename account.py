@@ -26,7 +26,7 @@ from kis_rate import (
     _response_indicates_rate_limit,
     kis_request,
 )
-from trade_state import sync_positions_file_from_broker_holdings
+from trade_state import sync_positions_from_broker_holdings
 
 logger = logging.getLogger(__name__)
 
@@ -345,19 +345,13 @@ def get_account_snapshot(access_token: str | None = None) -> dict[str, object]:
     output2 = data.get("output2") or []
     summary = output2[0] if isinstance(output2, list) and output2 else output2 or {}
     holdings = extract_balance_holdings(data)
-    synced_count = sync_positions_file_from_broker_holdings(holdings)
-    if synced_count != len(holdings):
-        logger.info(
-            "positions_state.json 덮어쓰기: broker %d종목 → 파일 %d종목",
-            len(holdings),
-            synced_count,
-        )
-    else:
-        logger.info(
-            "positions_state.json 덮어쓰기: %d종목 %s",
-            synced_count,
-            sorted(holdings.keys()),
-        )
+    synced_count = sync_positions_from_broker_holdings(holdings)
+    logger.info(
+        "메모리 포지션 동기화: broker %d종목 → runtime %d종목 %s",
+        len(holdings),
+        synced_count,
+        sorted(holdings.keys()),
+    )
     pnl = _parse_account_summary_row(summary if isinstance(summary, dict) else {})
     stock_eval = _resolve_stock_eval_amount(summary, holdings)
     cash = _intish(summary.get("dnca_tot_amt"))

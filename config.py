@@ -130,6 +130,10 @@ ACCOUNT_REFRESH_SEC = 60  # 계좌 잔고 UI 갱신 주기
 ACCOUNT_SNAPSHOT_REFRESH_SEC = 45  # 백엔드 잔고 스냅샷 (체결 확인용)
 ORDER_STATUS_POLL_SEC = 10  # 체결 폴러 — 매 틱 잔고 조회 금지
 
+# 보유 슬롯 — 기본은 프로세스 메모리. Render Disk 등 영속 볼륨이 있으면 경로 지정.
+# 예: POSITIONS_PERSIST_PATH=/var/data/positions_state.json
+POSITIONS_PERSIST_PATH = os.environ.get("POSITIONS_PERSIST_PATH", "").strip()
+
 # 무인 알림(Webhook) — 텔레그램/카카오/디스코드 연동용
 _ENABLE_RAW = str(os.environ.get("ENABLE_NOTIFICATIONS", "true")).strip().lower()
 ENABLE_NOTIFICATIONS = _ENABLE_RAW in ("1", "true", "yes", "on")

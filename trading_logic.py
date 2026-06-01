@@ -587,7 +587,7 @@ def build_commander_dashboard_metrics(
     from market_ai import enrich_commander_slots_with_quotes, get_ai_forecast_cached
     from trade_state import get_daily_realized_pnl, get_week_realized_summary
 
-    # 체결/수량 변동 직후에는 캐시를 무시하고 파일 기준으로 즉시 동기화한다.
+    # 체결 직후에는 trade_state 메모리(공유 스냅샷) 기준으로 정산 지표 반영.
     daily = get_daily_realized_pnl(force_refresh=True)
     weekly = get_week_realized_summary()
     ai = get_ai_forecast_cached()
@@ -1311,3 +1311,43 @@ def decide_position_exit(
     return decide_swing_exit(
         pos, current, profit_pct, hourly_bars=hourly_bars
     )
+
+
+def finalize_order_fill_dashboard_sync(
+    *,
+    side: str,
+    code: str,
+) -> None:
+    """
+    매수/매도 체결 직후 대시보드 즉시 갱신.
+    - 공유 메모리 nonce → Streamlit watchdog가 st.rerun()
+    - Streamlit 스크립트 컨텍스트 안이면 즉시 st.rerun() 시도
+    """
+    from stock_names import normalize_code
+    from trade_state import request_dashboard_refresh
+
+    norm_code = normalize_code(code)
+    reason = f"{side}:{norm_code or code}"
+    request_dashboard_refresh(reason)
+
+    try:
+        import streamlit as st
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        if get_script_run_ctx() is None:
+            return
+        for key in (
+            "runtime_positions",
+            "runtime_account",
+            "runtime_account_updated_at",
+            "commander_metrics",
+            "commander_metrics_sig",
+            "positions_display",
+        ):
+            st.session_state.pop(key, None)
+        st.rerun()
+    except Exception:
+        logger.debug(
+            "체결 직후 st.rerun() 스킵(백그라운드 스레드) — nonce=%s",
+            reason,
+        )

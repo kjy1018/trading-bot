@@ -179,7 +179,6 @@ _stats_date: date | None = None
 _last_position_persist: float = 0.0
 _POSITION_PERSIST_INTERVAL = 2.0
 _last_synced_slot_count: int = -1
-_last_loaded_positions_mtime: float = -1.0
 
 _emergency_lock = threading.Lock()
 _start_lock = threading.Lock()
@@ -570,7 +569,7 @@ def _refresh_account_snapshot(force: bool = False) -> dict[str, Any]:
     with _state_lock:
         _state["account_snapshot"] = snap
     _last_account_refresh_at = now
-    reload_positions_if_disk_changed()
+    _apply_runtime_positions_from_store()
     return snap
 
 
@@ -756,8 +755,31 @@ def _apply_trade_state_to_memory() -> None:
         _state["daily_stats_date"] = stats_date
 
 
+def _refresh_balance_after_fill(side: str, code: str) -> None:
+    """체결 직후 account.py 잔고 강제 조회 + 메모리·대시보드 동기화."""
+    norm = normalize_code(code)
+    try:
+        snap = _refresh_account_snapshot(force=True)
+        holdings = snap.get("holdings") or {}
+        logger.info(
+            "체결 직후 잔고 갱신: %s %s · broker %d종목 · slots %d",
+            side,
+            norm,
+            len(holdings) if isinstance(holdings, dict) else 0,
+            len(get_positions_snapshot()),
+        )
+    except Exception as exc:
+        logger.warning("체결 직후 잔고 갱신 실패 (%s %s): %s", side, norm, exc)
+    try:
+        from trading_logic import finalize_order_fill_dashboard_sync
+
+        finalize_order_fill_dashboard_sync(side=side, code=norm or code)
+    except Exception as exc:
+        logger.debug("체결 직후 dashboard sync 실패: %s", exc)
+
+
 def _force_refresh_trade_state_sync(reason: str = "") -> None:
-    """체결/수량 변동 직후 정산 지표를 파일 기준으로 강제 동기화."""
+    """체결/수량 변동 직후 정산 지표를 메모리·trade_state 기준으로 강제 동기화."""
     try:
         trade_state.force_refresh_daily_state()
     except Exception as exc:
@@ -991,7 +1013,8 @@ def _reset_daily_stats_if_needed() -> None:
     _apply_trade_state_to_memory()
 
 
-def _load_positions_from_disk() -> None:
+def _bootstrap_positions_from_store() -> None:
+    """메모리 포지션 스토어 → 스케줄러 _positions (기동·잔고 동기화 후)."""
     global _positions
     persisted = trade_state.load_persisted_positions()
     token: str | None = None
@@ -1015,18 +1038,36 @@ def _load_positions_from_disk() -> None:
     _sync_positions_state()
     if persisted:
         logger.info("보유 포지션 복구: %d종목 %s", len(persisted), list(persisted.keys()))
-    global _last_loaded_positions_mtime
-    _last_loaded_positions_mtime = trade_state.get_positions_file_mtime()
 
 
-def reload_positions_if_disk_changed() -> bool:
-    """positions_state.json mtime 변경 시 메모리 포지션 재로드."""
-    global _last_loaded_positions_mtime
-    mtime = trade_state.get_positions_file_mtime()
-    if mtime == _last_loaded_positions_mtime:
-        return False
-    _load_positions_from_disk()
-    return True
+def _apply_runtime_positions_from_store() -> None:
+    """account 잔고 동기화 직후 메모리 스토어 변경분을 _positions에 반영."""
+    persisted = trade_state.load_persisted_positions()
+    token: str | None = None
+    try:
+        token = get_access_token()
+    except Exception:
+        pass
+    with _positions_lock:
+        for code in list(_positions.keys()):
+            if code not in persisted:
+                del _positions[code]
+        for code, pos in persisted.items():
+            if code in _positions:
+                _positions[code].update(dict(pos))
+            else:
+                enriched = enrich_position(dict(pos), access_token=token)
+                _positions[code] = enriched
+                if not enriched.get("stop_loss_price"):
+                    _backfill_missing_atr_stop(code, enriched)
+                if not enriched.get("target_price"):
+                    _ensure_position_targets(code, enriched)
+    _sync_positions_state()
+
+
+def _load_positions_from_disk() -> None:
+    """레거시 별칭 — 디스크 대신 메모리 스토어에서 부트스트랩."""
+    _bootstrap_positions_from_store()
 
 
 def _backfill_missing_atr_stop(code: str, pos: dict[str, Any]) -> None:
@@ -1078,7 +1119,7 @@ def _backfill_missing_atr_stop(code: str, pos: dict[str, Any]) -> None:
         )
 
 
-def _persist_positions_to_disk() -> None:
+def _persist_positions_to_store() -> None:
     token: str | None = None
     try:
         token = get_access_token()
@@ -1093,13 +1134,18 @@ def _persist_positions_to_disk() -> None:
     trade_state.save_persisted_positions(snapshot)
 
 
+def _persist_positions_to_disk() -> None:
+    """레거시 별칭."""
+    _persist_positions_to_store()
+
+
 def _maybe_persist_positions(force: bool = False) -> None:
-    """웹소켓 고빈도 틱 시 디스크 쓰기 완화."""
+    """고빈도 틱 시 메모리 반영 완화."""
     global _last_position_persist
     now = time.time()
     if force or now - _last_position_persist >= _POSITION_PERSIST_INTERVAL:
         _last_position_persist = now
-        _persist_positions_to_disk()
+        _persist_positions_to_store()
 
 
 def _exit_type_label(reason: str, pnl: int) -> str:
@@ -1463,6 +1509,7 @@ def _apply_confirmed_buy_fill(order: dict[str, Any], holding: dict[str, Any]) ->
         price=fill_price,
         profit_pct=0.0,
     )
+    _refresh_balance_after_fill("buy", code)
     return msg
 
 
@@ -1488,6 +1535,7 @@ def _apply_confirmed_pyramid_fill(order: dict[str, Any], holding: dict[str, Any]
         price=fill_price,
         profit_pct=None,
     )
+    _refresh_balance_after_fill("pyramid_buy", code)
     return msg
 
 
@@ -1549,6 +1597,7 @@ def _apply_confirmed_sell_fill(order: dict[str, Any], remaining_qty: int) -> str
         price=exit_price,
         profit_pct=profit_pct,
     )
+    _refresh_balance_after_fill("sell", code)
     return msg
 
 
@@ -2091,7 +2140,7 @@ def _poll_pending_orders_once() -> None:
         return
 
     try:
-        account = _refresh_account_snapshot(force=False)
+        account = _refresh_account_snapshot(force=True)
     except Exception as exc:
         if is_rate_limit_error(exc):
             logger.debug("체결 폴러 속도 제한: %s", exc)

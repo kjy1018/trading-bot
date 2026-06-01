@@ -2,7 +2,7 @@
 """
 실계좌 보유 종목을 4세대 스윙 봇 메모리/디스크 포맷으로 주입합니다.
 
-※ 보유 슬롯은 positions_state.json 에 저장됩니다.
+※ 보유 슬롯은 trade_state 메모리 스토어(선택: POSITIONS_PERSIST_PATH)에 저장됩니다.
   trade_state.json 은 당일 청산 영수증(completed_trades) 전용이며,
   슬롯 1·2 순서는 positions 딕셔너리 삽입 순서 → 대시보드 1·2번 슬롯에 반영됩니다.
 
@@ -20,9 +20,9 @@ import sys
 from datetime import date, datetime
 from pathlib import Path
 
-PROJECT_DIR = Path(__file__).resolve().parent
-POSITIONS_STATE_FILE = PROJECT_DIR / "positions_state.json"
-TRADE_STATE_FILE = PROJECT_DIR / "trade_state.json"
+import trade_state
+
+TRADE_STATE_FILE = trade_state.TRADE_STATE_FILE
 
 # 슬롯 순서 = 아래 리스트 순서 (1번 → 2번)
 INJECTIONS: list[dict] = [
@@ -147,12 +147,8 @@ def inject(
     live_prices = _fetch_current_prices(codes) if fetch_price else {}
 
     existing: dict[str, dict] = {}
-    if merge and POSITIONS_STATE_FILE.is_file():
-        try:
-            raw = json.loads(POSITIONS_STATE_FILE.read_text(encoding="utf-8"))
-            existing = dict(raw.get("positions") or {})
-        except (json.JSONDecodeError, OSError):
-            existing = {}
+    if merge:
+        existing = trade_state.load_persisted_positions()
 
     positions: dict[str, dict] = {} if not merge else {}
     if merge:
@@ -173,14 +169,14 @@ def inject(
             current_price=cur,
         )
 
-    _save_json(POSITIONS_STATE_FILE, {"positions": positions})
+    trade_state.save_persisted_positions(positions)
     _ensure_trade_state_daily()
     return positions
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="스윙 봇 보유 슬롯(1·2)에 종목을 positions_state.json 에 주입"
+        description="스윙 봇 보유 슬롯(1·2)에 종목을 메모리 포지션 스토어에 주입"
     )
     parser.add_argument(
         "--entry-date",
@@ -206,7 +202,7 @@ def main() -> int:
     )
 
     print("[OK] 주입 완료")
-    print(f"   파일: {POSITIONS_STATE_FILE}")
+    print(f"   revision: {trade_state.get_positions_revision()}")
     print(f"   trade_state.json: 당일 영수증만 유지 ({TRADE_STATE_FILE})")
     print()
     for spec in INJECTIONS:

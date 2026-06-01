@@ -40,7 +40,8 @@ from trading_logic import (
 from trade_state import (
     ensure_trade_state_file,
     get_daily_signature,
-    get_positions_file_mtime,
+    get_dashboard_refresh_nonce,
+    get_positions_revision,
     get_weekly_signature,
 )
 from scheduler import (
@@ -69,7 +70,6 @@ from scheduler import (
     get_watch_time_snapshot,
     manual_buy_recommended_pick,
     preview_manual_pick_entry,
-    reload_positions_if_disk_changed,
     start_background_scheduler,
     update_position_trading_mode,
 )
@@ -127,11 +127,47 @@ def _clear_positions_session_cache() -> None:
         st.session_state.pop(key, None)
 
 
+def _mirror_runtime_state_to_session(*, force: bool = False) -> bool:
+    """스케줄러 메모리 스냅샷 → st.session_state (잔고·슬롯 즉시 UI 반영)."""
+    revision = int(get_positions_revision())
+    account = get_account_ui_snapshot()
+    acct_ts = str(account.get("updated_at") or "")
+    prev_rev = st.session_state.get("runtime_state_revision")
+    prev_acct = st.session_state.get("runtime_account_updated_at")
+    if (
+        not force
+        and prev_rev == revision
+        and prev_acct == acct_ts
+        and st.session_state.get("runtime_positions") is not None
+    ):
+        return False
+
+    positions = get_positions_snapshot()
+    st.session_state["runtime_state_revision"] = revision
+    st.session_state["runtime_account"] = dict(account)
+    st.session_state["runtime_account_updated_at"] = acct_ts
+    st.session_state["runtime_positions"] = [dict(p) for p in positions if isinstance(p, dict)]
+    return True
+
+
+def _session_account_snapshot() -> dict[str, Any]:
+    snap = st.session_state.get("runtime_account")
+    return dict(snap) if isinstance(snap, dict) else get_account_ui_snapshot()
+
+
+def _session_positions_snapshot() -> list[dict[str, Any]]:
+    rows = st.session_state.get("runtime_positions")
+    if isinstance(rows, list):
+        return [dict(p) for p in rows if isinstance(p, dict)]
+    return [dict(p) for p in get_positions_snapshot()]
+
+
 def _ui_scheduler_signature() -> tuple[Any, ...]:
     """스케줄러·계좌 스냅샷 변경 감지 — 세션 캐시 무효화용."""
+    _mirror_runtime_state_to_session()
     status = get_scheduler_status()
-    positions = get_positions_snapshot()
-    account = get_account_ui_snapshot()
+    positions = _session_positions_snapshot()
+    account = _session_account_snapshot()
     pos_codes = tuple(
         sorted(
             code
@@ -152,13 +188,15 @@ def _ui_scheduler_signature() -> tuple[Any, ...]:
         acct_codes,
         int(account.get("stock_eval") or account.get("total_eval") or 0),
         int(account.get("cash") or 0),
-        float(get_positions_file_mtime()),
+        int(get_positions_revision()),
+        int(get_dashboard_refresh_nonce()),
     )
 
 
 def _sync_ui_snapshots_from_scheduler(*, trigger_rerun: bool = False) -> bool:
     """account/positions 스냅샷 시그니처 변경 시 UI 세션 캐시를 버리고 필요하면 rerun."""
-    if reload_positions_if_disk_changed():
+    mirrored = _mirror_runtime_state_to_session()
+    if mirrored:
         _clear_positions_session_cache()
         _clear_commander_metrics_cache()
     sig = _ui_scheduler_signature()
@@ -221,8 +259,9 @@ def _sync_boot_scan_to_session() -> None:
     if narr and "대기" not in narr:
         st.session_state["immediate_boot_scan_done"] = True
 def _read_account_panel_values() -> tuple[int, int, int, bool, str | None]:
-    """스케줄러 account_snapshot만 사용 — Streamlit 세션 TTL 캐시 없음."""
-    snap = get_account_ui_snapshot()
+    """st.session_state.runtime_account 우선 — 스케줄러 잔고 즉시 반영."""
+    _mirror_runtime_state_to_session()
+    snap = _session_account_snapshot()
     stock_eval = int(snap.get("stock_eval") or snap.get("total_eval") or 0)
     cash = int(snap.get("cash") or 0)
     account_total = int(snap.get("account_total_eval") or (stock_eval + cash))
@@ -272,8 +311,8 @@ def _store_stable_positions(
 
 def _positions_for_display() -> list[dict[str, Any]]:
     _sync_ui_snapshots_from_scheduler(trigger_rerun=False)
-    reload_positions_if_disk_changed()
-    snap = get_positions_snapshot()
+    _mirror_runtime_state_to_session()
+    snap = _session_positions_snapshot()
     token = st.session_state.get("access_token")
     status = get_scheduler_status()
     slot_count = int(status.get("slot_count", 0))
@@ -1349,29 +1388,34 @@ def _render_slots_grid(positions: list[dict[str, Any]], max_slots: int) -> None:
                     _render_empty_control_slot(idx, controls.get(idx), positions)
 
 
-@st.fragment(run_every=timedelta(seconds=3))
+@st.fragment(run_every=timedelta(seconds=1))
 def _ui_snapshot_watchdog() -> None:
-    """잔고·positions_state.json 변경 시 세션 캐시 무시 후 st.rerun()으로 전체 새로고침."""
-    file_mtime = float(get_positions_file_mtime())
-    prev_mtime = float(st.session_state.get("ui_positions_file_mtime") or 0.0)
-    account_updated = str((get_account_ui_snapshot() or {}).get("updated_at") or "")
-    prev_account_updated = str(st.session_state.get("ui_account_updated_at") or "")
-
-    if reload_positions_if_disk_changed():
-        _clear_positions_session_cache()
-        _clear_commander_metrics_cache()
-
-    st.session_state["ui_positions_file_mtime"] = file_mtime
-    st.session_state["ui_account_updated_at"] = account_updated
-
-    if prev_mtime and file_mtime > prev_mtime:
+    """체결·잔고 변경 nonce → st.session_state 미러 → st.rerun()."""
+    prev_nonce = st.session_state.get("ui_dashboard_refresh_nonce")
+    fill_nonce = int(get_dashboard_refresh_nonce())
+    if prev_nonce is not None and fill_nonce != prev_nonce:
+        st.session_state["ui_dashboard_refresh_nonce"] = fill_nonce
+        _mirror_runtime_state_to_session(force=True)
         _clear_positions_session_cache()
         _clear_commander_metrics_cache()
         st.rerun()
         return
-    if prev_account_updated and account_updated and account_updated != prev_account_updated:
+    if prev_nonce is None:
+        st.session_state["ui_dashboard_refresh_nonce"] = fill_nonce
+
+    prev_rev = st.session_state.get("runtime_state_revision")
+    prev_acct = st.session_state.get("runtime_account_updated_at")
+
+    if _mirror_runtime_state_to_session():
         _clear_positions_session_cache()
         _clear_commander_metrics_cache()
+
+    rev = st.session_state.get("runtime_state_revision")
+    acct = st.session_state.get("runtime_account_updated_at")
+    if prev_rev is not None and rev != prev_rev:
+        st.rerun()
+        return
+    if prev_acct and acct and acct != prev_acct:
         st.rerun()
         return
 
@@ -1595,6 +1639,7 @@ def _receipts_panel() -> None:
 
 
 _warm_ui_session_caches()
+_mirror_runtime_state_to_session(force=True)
 _sync_boot_scan_to_session()
 _sync_watch_time_from_scheduler()
 _handle_browser_refresh_force_scan()

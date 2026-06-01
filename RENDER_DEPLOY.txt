@@ -29,3 +29,15 @@ Render.com Background Worker 배포 가이드
 - DISCORD_BOT_TOKEN
 - DISCORD_CHANNEL_ID
 - (선택) GEMINI_API_KEY
+
+6) 보유 슬롯(positions) 저장
+- 기본: 프로세스 메모리 (Render ephemeral FS 에 파일 쓰지 않음)
+- account.py 잔고 조회 시 KIS holdings → 메모리 스토어 즉시 동기화
+- 재부팅 후에도 유지하려면 Render Disk 마운트 후:
+  POSITIONS_PERSIST_PATH=/var/data/positions_state.json
+- Streamlit 대시보드는 st.session_state.runtime_* 로 스케줄러 메모리를 미러링
+  (같은 프로세스에서 python -m streamlit run main.py 실행 시)
+
+7) Redis 등 외부 DB (선택)
+- Worker 와 Streamlit 을 분리 배포할 때는 Redis/Postgres 등에
+  positions 스냅샷을 publish 하는 방식으로 확장 가능 (현재 미구현)
