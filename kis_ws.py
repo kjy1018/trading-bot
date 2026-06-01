@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import threading
 import time
 from typing import Any, Callable
@@ -217,6 +218,10 @@ class KisRealtimeHub:
                     f"(한도 {self._heartbeat_timeout:.0f}s)"
                 )
 
+    def _next_reconnect_delay(self) -> float:
+        """재연결 루프 과열 방지: 30~60초 랜덤 강제 대기."""
+        return float(random.randint(30, 60))
+
     def start(self) -> bool:
         if not _HAS_WS:
             logger.error("pip install websocket-client 필요")
@@ -284,7 +289,6 @@ class KisRealtimeHub:
                 self._subscribed.add(code)
 
     def _run_loop(self) -> None:
-        backoff = 1.0
         hub = self
 
         while hub._running:
@@ -357,12 +361,12 @@ class KisRealtimeHub:
                 hub._reconnecting = True
                 logger.exception("ws run_forever")
                 hub._emit("WS 연결 끊김 (재연결 중...)", str(exc))
-                time.sleep(min(backoff, 30.0))
-                backoff = min(backoff * 1.5, 30.0)
-            else:
-                backoff = 1.0
             if not hub._running:
                 break
+            delay = hub._next_reconnect_delay()
             hub._reconnecting = True
-            hub._emit("WS 연결 끊김 (재연결 중...)", hub._last_error)
-            time.sleep(1.0)
+            hub._emit(
+                "WS 연결 끊김 (재연결 대기)",
+                f"{hub._last_error or '연결 거부/종료'} · {delay:.0f}초 후 재시도",
+            )
+            time.sleep(delay)

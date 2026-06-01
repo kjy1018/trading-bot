@@ -1313,15 +1313,137 @@ def decide_position_exit(
     )
 
 
+def order_requested_quantity(order: dict[str, Any]) -> int:
+    return max(0, int(order.get("quantity") or 0))
+
+
+def order_baseline_quantity(order: dict[str, Any]) -> int:
+    return max(0, int(order.get("baseline_qty") or 0))
+
+
+def cumulative_buy_fill_qty(order: dict[str, Any], current_holding_qty: int) -> int:
+    return max(0, int(current_holding_qty) - order_baseline_quantity(order))
+
+
+def cumulative_sell_fill_qty(order: dict[str, Any], current_holding_qty: int) -> int:
+    return max(0, order_baseline_quantity(order) - int(current_holding_qty))
+
+
+def is_total_order_fill(
+    action: str,
+    order: dict[str, Any],
+    current_holding_qty: int,
+) -> bool:
+    """주문 수량 대비 전량 체결(또는 매도 목표 잔량 도달) 여부."""
+    act = str(action or "").strip().lower()
+    requested = order_requested_quantity(order)
+    baseline = order_baseline_quantity(order)
+    current = max(0, int(current_holding_qty))
+
+    if act in ("buy", "pyramid_buy"):
+        filled = cumulative_buy_fill_qty(order, current)
+        if requested <= 0:
+            return filled > 0
+        return filled >= requested
+
+    if act == "sell":
+        if baseline <= 0:
+            return False
+        if current >= baseline:
+            return False
+        if requested <= 0:
+            return current <= 0
+        target_remaining = max(0, baseline - requested)
+        return current <= target_remaining
+
+    return False
+
+
+def has_partial_order_fill(
+    action: str,
+    order: dict[str, Any],
+    current_holding_qty: int,
+) -> bool:
+    """부분 체결 진행 중(아직 total fill 아님)."""
+    act = str(action or "").strip().lower()
+    current = max(0, int(current_holding_qty))
+    baseline = order_baseline_quantity(order)
+
+    if act in ("buy", "pyramid_buy"):
+        return cumulative_buy_fill_qty(order, current) > 0 and not is_total_order_fill(
+            act, order, current
+        )
+    if act == "sell":
+        return current < baseline and not is_total_order_fill(act, order, current)
+    return False
+
+
+def partial_fill_progress_message(
+    action: str,
+    order: dict[str, Any],
+    current_holding_qty: int,
+) -> str:
+    from stock_names import normalize_code
+    from notification_manager import NotificationManager
+
+    act = str(action or "").strip().lower()
+    requested = order_requested_quantity(order)
+    code = normalize_code(order.get("code") or "")
+    name = str(order.get("name") or code or "-")
+    price = int(order.get("reference_price") or order.get("estimated_fill_price") or 0)
+
+    def send_discord_alert(*, side: str, qty: int, detail: str) -> None:
+        # 부분체결 때는 "알림만" 즉시 전송하고, 잔고/UI 갱신은 전량체결에서만 처리.
+        notifier = getattr(partial_fill_progress_message, "_notifier", None)
+        if notifier is None:
+            notifier = NotificationManager()
+            setattr(partial_fill_progress_message, "_notifier", notifier)
+        if qty > 0:
+            notifier.send_fill(
+                side=side,
+                code=code or str(order.get("code") or ""),
+                name=name,
+                qty=int(qty),
+                detail=str(detail),
+                price=int(price or 0),
+                profit_pct=None,
+            )
+
+    if act in ("buy", "pyramid_buy"):
+        filled = cumulative_buy_fill_qty(order, current_holding_qty)
+        target = requested if requested > 0 else "?"
+        msg = f"부분 매수 체결 {filled}/{target}주 · 전량 체결 대기"
+        try:
+            send_discord_alert(
+                side="추가매수" if act == "pyramid_buy" else "매수",
+                qty=filled,
+                detail=msg,
+            )
+        except Exception as exc:
+            logger.debug("부분 체결 디스코드 알림 실패: %s", exc)
+        return msg
+
+    if act == "sell":
+        filled = cumulative_sell_fill_qty(order, current_holding_qty)
+        target = requested if requested > 0 else order_baseline_quantity(order)
+        msg = f"부분 매도 체결 {filled}/{target}주 · 전량 체결 대기"
+        try:
+            send_discord_alert(side="매도", qty=filled, detail=msg)
+        except Exception as exc:
+            logger.debug("부분 체결 디스코드 알림 실패: %s", exc)
+        return msg
+
+    return "부분 체결 진행 중"
+
+
 def finalize_order_fill_dashboard_sync(
     *,
     side: str,
     code: str,
 ) -> None:
     """
-    매수/매도 체결 직후 대시보드 즉시 갱신.
-    - 공유 메모리 nonce → Streamlit watchdog가 st.rerun()
-    - Streamlit 스크립트 컨텍스트 안이면 즉시 st.rerun() 시도
+    전량 체결 확정 직후 대시보드 즉시 갱신.
+    부분 체결 중에는 호출하지 않음.
     """
     from stock_names import normalize_code
     from trade_state import request_dashboard_refresh

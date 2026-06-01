@@ -339,19 +339,28 @@ def get_holdings_snapshot(access_token: str | None = None) -> dict[str, dict]:
     return extract_balance_holdings(data)
 
 
-def get_account_snapshot(access_token: str | None = None) -> dict[str, object]:
+def get_account_snapshot(
+    access_token: str | None = None,
+    *,
+    sync_runtime_positions: bool = True,
+    bump_positions_revision: bool = True,
+) -> dict[str, object]:
     """계좌 요약 + 보유 종목 스냅샷 + 당일/총 수익 지표(KIS output2)."""
     data = inquire_balance_with_retry(access_token)
     output2 = data.get("output2") or []
     summary = output2[0] if isinstance(output2, list) and output2 else output2 or {}
     holdings = extract_balance_holdings(data)
-    synced_count = sync_positions_from_broker_holdings(holdings)
-    logger.info(
-        "메모리 포지션 동기화: broker %d종목 → runtime %d종목 %s",
-        len(holdings),
-        synced_count,
-        sorted(holdings.keys()),
-    )
+    if sync_runtime_positions:
+        synced_count = sync_positions_from_broker_holdings(
+            holdings,
+            bump_revision=bump_positions_revision,
+        )
+        logger.info(
+            "메모리 포지션 동기화: broker %d종목 → runtime %d종목 %s",
+            len(holdings),
+            synced_count,
+            sorted(holdings.keys()),
+        )
     pnl = _parse_account_summary_row(summary if isinstance(summary, dict) else {})
     stock_eval = _resolve_stock_eval_amount(summary, holdings)
     cash = _intish(summary.get("dnca_tot_amt"))

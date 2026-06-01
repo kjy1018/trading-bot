@@ -542,18 +542,33 @@ def _clear_position_order_pending(code: str, ticket_id: str | None = None) -> No
     _sync_positions_state()
 
 
-def _refresh_account_snapshot(force: bool = False) -> dict[str, Any]:
+def _refresh_account_snapshot(
+    force: bool = False,
+    *,
+    sync_runtime_positions: bool = True,
+    bump_positions_revision: bool = True,
+    publish_to_state: bool = True,
+) -> dict[str, Any]:
     global _last_account_refresh_at
     now = _now_ts()
     with _state_lock:
         cached = dict(_state.get("account_snapshot") or {})
-    if not force and cached.get("updated_at") and now - _last_account_refresh_at < ACCOUNT_SNAPSHOT_REFRESH_SEC:
+    if (
+        not force
+        and publish_to_state
+        and cached.get("updated_at")
+        and now - _last_account_refresh_at < ACCOUNT_SNAPSHOT_REFRESH_SEC
+    ):
         return cached
 
     token = get_access_token()
     try:
         snap = call_with_retry(
-            lambda: get_account_snapshot(token),
+            lambda: get_account_snapshot(
+                token,
+                sync_runtime_positions=sync_runtime_positions,
+                bump_positions_revision=bump_positions_revision,
+            ),
             priority=Priority.NORMAL,
             user_message="잔고 조회 재시도 중...",
         )
@@ -566,10 +581,12 @@ def _refresh_account_snapshot(force: bool = False) -> dict[str, Any]:
             return stale
         raise
     snap["stale"] = False
-    with _state_lock:
-        _state["account_snapshot"] = snap
-    _last_account_refresh_at = now
-    _apply_runtime_positions_from_store()
+    if publish_to_state:
+        with _state_lock:
+            _state["account_snapshot"] = snap
+        _last_account_refresh_at = now
+        if sync_runtime_positions:
+            _apply_runtime_positions_from_store()
     return snap
 
 
@@ -756,10 +773,14 @@ def _apply_trade_state_to_memory() -> None:
 
 
 def _refresh_balance_after_fill(side: str, code: str) -> None:
-    """체결 직후 account.py 잔고 강제 조회 + 메모리·대시보드 동기화."""
+    """전량 체결 확정 직후 account.py 잔고 강제 조회 + 메모리·대시보드 동기화."""
     norm = normalize_code(code)
     try:
-        snap = _refresh_account_snapshot(force=True)
+        snap = _refresh_account_snapshot(
+            force=True,
+            sync_runtime_positions=True,
+            bump_positions_revision=True,
+        )
         holdings = snap.get("holdings") or {}
         logger.info(
             "체결 직후 잔고 갱신: %s %s · broker %d종목 · slots %d",
@@ -1518,13 +1539,49 @@ def _build_position_payload(
     }
 
 
+def _note_partial_fill_progress(
+    order: dict[str, Any],
+    ticket_id: str,
+    action: str,
+    current_qty: int,
+) -> None:
+    """부분 체결 — 알림·잔고·UI 갱신 없이 주문 상태만 갱신."""
+    from trading_logic import (
+        cumulative_buy_fill_qty,
+        cumulative_sell_fill_qty,
+        has_partial_order_fill,
+        partial_fill_progress_message,
+    )
+
+    if not has_partial_order_fill(action, order, current_qty):
+        return
+    act = str(action or "").strip().lower()
+    if act in ("buy", "pyramid_buy"):
+        filled = cumulative_buy_fill_qty(order, current_qty)
+    else:
+        filled = cumulative_sell_fill_qty(order, current_qty)
+    prev_filled = int(order.get("filled_qty") or 0)
+    if str(order.get("status") or "") == "partial_fill" and filled == prev_filled:
+        return
+    msg = partial_fill_progress_message(action, order, current_qty)
+    _update_order_state(
+        ticket_id,
+        status="partial_fill",
+        filled_qty=filled,
+        message=msg,
+    )
+    logger.debug("부분 체결 진행 %s · %s (전량 체결 시 알림)", ticket_id, msg)
+
+
 def _apply_confirmed_buy_fill(order: dict[str, Any], holding: dict[str, Any]) -> str:
+    from trading_logic import cumulative_buy_fill_qty, order_requested_quantity
+
     code = normalize_code(order.get("code"))
-    baseline = int(order.get("baseline_qty") or 0)
     hold_qty = int(holding.get("quantity") or 0)
-    fill_qty = max(0, hold_qty - baseline)
-    if fill_qty <= 0:
-        fill_qty = int(order.get("quantity") or 0)
+    requested = order_requested_quantity(order)
+    fill_qty = cumulative_buy_fill_qty(order, hold_qty)
+    if requested > 0:
+        fill_qty = min(fill_qty, requested)
     fill_price = int(holding.get("avg_price") or order.get("reference_price") or 0)
     if fill_price <= 0:
         fill_price = int(order.get("reference_price") or 0)
@@ -1555,12 +1612,14 @@ def _apply_confirmed_buy_fill(order: dict[str, Any], holding: dict[str, Any]) ->
 
 
 def _apply_confirmed_pyramid_fill(order: dict[str, Any], holding: dict[str, Any]) -> str:
+    from trading_logic import cumulative_buy_fill_qty, order_requested_quantity
+
     code = normalize_code(order.get("code"))
-    baseline = int(order.get("baseline_qty") or 0)
     hold_qty = int(holding.get("quantity") or 0)
-    fill_qty = max(0, hold_qty - baseline)
-    if fill_qty <= 0:
-        fill_qty = int(order.get("quantity") or 0)
+    requested = order_requested_quantity(order)
+    fill_qty = cumulative_buy_fill_qty(order, hold_qty)
+    if requested > 0:
+        fill_qty = min(fill_qty, requested)
     fill_price = int(holding.get("avg_price") or order.get("reference_price") or 0)
     add_budget = fill_qty * max(fill_price, 0)
     _merge_pyramid_into_position(code, fill_qty, fill_price, add_budget)
@@ -1581,6 +1640,8 @@ def _apply_confirmed_pyramid_fill(order: dict[str, Any], holding: dict[str, Any]
 
 
 def _apply_confirmed_sell_fill(order: dict[str, Any], remaining_qty: int) -> str:
+    from trading_logic import cumulative_sell_fill_qty, order_requested_quantity
+
     code = normalize_code(order.get("code"))
     with _positions_lock:
         pos = dict(_positions.get(code) or {})
@@ -1588,10 +1649,11 @@ def _apply_confirmed_sell_fill(order: dict[str, Any], remaining_qty: int) -> str
         return f"[매도체결] {code}"
 
     baseline = int(order.get("baseline_qty") or pos.get("quantity") or 0)
-    requested = int(order.get("quantity") or baseline)
-    sold_qty = max(0, min(requested, baseline - remaining_qty))
+    requested = order_requested_quantity(order) or baseline
+    sold_qty = cumulative_sell_fill_qty(order, remaining_qty)
     if sold_qty <= 0:
         sold_qty = requested
+    sold_qty = min(sold_qty, requested) if requested > 0 else sold_qty
     exit_price = int(order.get("estimated_fill_price") or pos.get("current_price") or pos.get("entry_price") or 0)
     entry = int(pos.get("entry_price") or 0)
     profit_pct = (exit_price - entry) / entry * 100 if entry else 0.0
@@ -2181,7 +2243,12 @@ def _poll_pending_orders_once() -> None:
         return
 
     try:
-        account = _refresh_account_snapshot(force=True)
+        account = _refresh_account_snapshot(
+            force=True,
+            sync_runtime_positions=False,
+            bump_positions_revision=False,
+            publish_to_state=False,
+        )
     except Exception as exc:
         if is_rate_limit_error(exc):
             logger.debug("체결 폴러 속도 제한: %s", exc)
@@ -2193,6 +2260,8 @@ def _poll_pending_orders_once() -> None:
 
     holdings = dict(account.get("holdings") or {})
 
+    from trading_logic import is_total_order_fill
+
     for order in pending:
         ticket_id = str(order.get("ticket_id"))
         code = normalize_code(order.get("code"))
@@ -2202,21 +2271,33 @@ def _poll_pending_orders_once() -> None:
         current_qty = int(holding.get("quantity") or 0)
 
         if action == "buy":
-            if current_qty > baseline:
-                msg = _apply_confirmed_buy_fill(order, holding)
-                _update_order_state(ticket_id, status="filled", message=msg)
-                _force_refresh_trade_state_sync("buy_fill_detected")
+            if current_qty <= baseline:
+                continue
+            if not is_total_order_fill(action, order, current_qty):
+                _note_partial_fill_progress(order, ticket_id, action, current_qty)
+                continue
+            msg = _apply_confirmed_buy_fill(order, holding)
+            _update_order_state(ticket_id, status="filled", message=msg)
+            _force_refresh_trade_state_sync("buy_fill_detected")
         elif action == "pyramid_buy":
-            if current_qty > baseline:
-                msg = _apply_confirmed_pyramid_fill(order, holding)
-                _update_order_state(ticket_id, status="filled", message=msg)
-                _force_refresh_trade_state_sync("pyramid_fill_detected")
+            if current_qty <= baseline:
+                continue
+            if not is_total_order_fill(action, order, current_qty):
+                _note_partial_fill_progress(order, ticket_id, action, current_qty)
+                continue
+            msg = _apply_confirmed_pyramid_fill(order, holding)
+            _update_order_state(ticket_id, status="filled", message=msg)
+            _force_refresh_trade_state_sync("pyramid_fill_detected")
         elif action == "sell":
-            if current_qty < baseline:
-                msg = _apply_confirmed_sell_fill(order, current_qty)
-                _update_order_state(ticket_id, status="filled", message=msg)
-                _clear_position_order_pending(code, ticket_id)
-                _force_refresh_trade_state_sync("sell_fill_detected")
+            if current_qty >= baseline:
+                continue
+            if not is_total_order_fill(action, order, current_qty):
+                _note_partial_fill_progress(order, ticket_id, action, current_qty)
+                continue
+            msg = _apply_confirmed_sell_fill(order, current_qty)
+            _update_order_state(ticket_id, status="filled", message=msg)
+            _clear_position_order_pending(code, ticket_id)
+            _force_refresh_trade_state_sync("sell_fill_detected")
 
 
 def _order_fill_loop() -> None:

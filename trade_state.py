@@ -289,10 +289,13 @@ def save_persisted_positions(positions: dict[str, dict[str, Any]]) -> None:
 
 def sync_positions_from_broker_holdings(
     holdings: dict[str, dict[str, Any]],
+    *,
+    bump_revision: bool = True,
 ) -> int:
     """
     KIS 잔고 holdings 기준으로 in-memory 포지션 전체 동기화.
     증권사에 없는 종목은 메모리에서 제거, 보유 종목은 수량·시세 반영.
+    bump_revision=False — 체결 폴러 등 UI 신호 없이 잔고만 조회할 때.
     """
     with _lock:
         _bootstrap_runtime_positions_once()
@@ -338,7 +341,8 @@ def sync_positions_from_broker_holdings(
 
         _runtime_positions.clear()
         _runtime_positions.update(synced)
-        _bump_positions_revision()
+        if bump_revision:
+            _bump_positions_revision()
         snapshot = {k: dict(v) for k, v in synced.items()}
     _maybe_persist_positions_to_disk(snapshot)
     return len(synced)

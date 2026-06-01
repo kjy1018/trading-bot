@@ -1388,7 +1388,7 @@ def _render_slots_grid(positions: list[dict[str, Any]], max_slots: int) -> None:
                     _render_empty_control_slot(idx, controls.get(idx), positions)
 
 
-@st.fragment(run_every=timedelta(seconds=1))
+@st.fragment(run_every=timedelta(seconds=3))
 def _ui_snapshot_watchdog() -> None:
     """체결·잔고 변경 nonce → st.session_state 미러 → st.rerun()."""
     prev_nonce = st.session_state.get("ui_dashboard_refresh_nonce")
