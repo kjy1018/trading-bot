@@ -121,6 +121,7 @@ class KisRealtimeHub:
         self._last_rx_at: float = 0.0
         self._last_trade_at: float = 0.0
         self._reconnecting = False
+        self._opened_once = False
 
     def _touch_rx(self) -> None:
         self._last_rx_at = time.time()
@@ -132,7 +133,16 @@ class KisRealtimeHub:
         return max(0.0, time.time() - ref)
 
     def is_connected(self) -> bool:
-        return bool(_HAS_WS and self._running and self._connected)
+        app = self._ws_app
+        sock = getattr(app, "sock", None) if app is not None else None
+        return bool(
+            _HAS_WS
+            and self._running
+            and self._connected
+            and self._opened_once
+            and app is not None
+            and sock is not None
+        )
 
     def is_ready(self) -> bool:
         """소켓 open + heartbeat 구간 내 실제 수신이 있어야 True."""
@@ -197,17 +207,14 @@ class KisRealtimeHub:
         self._reconnecting = True
         logger.warning("ws heartbeat timeout — reconnect: %s", reason)
         self._emit("WS 연결 끊김 (재연결 중...)", reason)
-        app = self._ws_app
-        if app is not None:
-            try:
-                app.close()
-            except Exception as exc:
-                logger.debug("ws close on heartbeat: %s", exc)
+        self._safe_ws_close(self._ws_app, context="heartbeat")
 
     def _heartbeat_loop(self) -> None:
         while self._running:
             time.sleep(1.0)
             if not self._connected:
+                continue
+            if self._ws_app is None:
                 continue
             gap = self._seconds_since_rx()
             if gap is None:
@@ -244,11 +251,7 @@ class KisRealtimeHub:
     def stop(self) -> None:
         self._running = False
         self._connected = False
-        try:
-            if self._ws_app:
-                self._ws_app.close()
-        except Exception:
-            pass
+        self._safe_ws_close(self._ws_app, context="stop")
 
     def _approval(self) -> str:
         if self._approval_key and time.time() - self._approval_ts < 3500:
@@ -260,6 +263,8 @@ class KisRealtimeHub:
         return self._approval_key
 
     def _send(self, ws: websocket.WebSocketApp, code: str, reg: str) -> None:
+        if ws is None:
+            return
         payload = {
             "header": {
                 "approval_key": self._approval(),
@@ -269,7 +274,40 @@ class KisRealtimeHub:
             },
             "body": {"input": {"tr_id": "H0STCNT0", "tr_key": code}},
         }
-        ws.send(json.dumps(payload))
+        self._safe_ws_send(ws, json.dumps(payload), context=f"reg:{code}:{reg}")
+
+    def _safe_ws_send(
+        self,
+        ws: websocket.WebSocketApp | None,
+        payload: str,
+        *,
+        context: str,
+    ) -> None:
+        if ws is None:
+            return
+        sock = getattr(ws, "sock", None)
+        if sock is None:
+            return
+        try:
+            ws.send(payload)
+        except Exception as exc:
+            logger.debug("ws send skipped (%s): %s", context, exc)
+
+    def _safe_ws_close(
+        self,
+        ws: websocket.WebSocketApp | None,
+        *,
+        context: str,
+    ) -> None:
+        if ws is None:
+            return
+        sock = getattr(ws, "sock", None)
+        if sock is None:
+            return
+        try:
+            ws.close()
+        except Exception as exc:
+            logger.debug("ws close skipped (%s): %s", context, exc)
 
     def _sync(self, ws: websocket.WebSocketApp) -> None:
         with self._lock:
@@ -298,7 +336,10 @@ class KisRealtimeHub:
                 hub._emit("WS 연결 시도", None)
 
                 def on_open(ws: websocket.WebSocketApp) -> None:
+                    if ws is None:
+                        return
                     hub._connected = True
+                    hub._opened_once = True
                     hub._reconnecting = False
                     hub._connected_at = time.time()
                     hub._last_rx_at = 0.0
@@ -314,7 +355,7 @@ class KisRealtimeHub:
                             j = json.loads(message)
                             hdr = j.get("header") or {}
                             if hdr.get("tr_id") == "PINGPONG":
-                                ws.send(message)
+                                hub._safe_ws_send(ws, message, context="pingpong")
                                 return
                             if hub._connected and hub._status_label.startswith("WS 연결"):
                                 hub._emit("WS 정상 (실시간 수신 중)", None)
