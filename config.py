@@ -21,17 +21,32 @@ BASE_URL = "https://openapivts.koreainvestment.com:29443"
 
 # 국내주식 실시간 체결가 WebSocket (모의: kis_devlp.yaml vops)
 WS_BASE_URL = "ws://ops.koreainvestment.com:31000"
-USE_REALTIME_WEBSOCKET = True
+# False — 스윙/장투 폴링 전용 (WS 단타 틱 비활성)
+USE_REALTIME_WEBSOCKET = False
+POLLING_STRATEGY_MODE = True
 WS_FAILBACK_POLL_SEC = 5.0  # WS 미사용/끊김 시 REST 폴백 주기
 WS_WATCHLIST_TOP_N = 20  # 빈 슬롯 시 WS 구독할 유니버스 상위 N
 WS_SCAN_DEBOUNCE_SEC = 0.8  # WS 틱 기반 재탐색 최소 간격
 WS_ENGINE_WAIT_SEC = 0.05  # WS 연결 시 엔진 대기(이벤트 깨우기)
-WS_HEARTBEAT_TIMEOUT_SEC = float(os.environ.get("WS_HEARTBEAT_TIMEOUT_SEC", "5"))
+# 보안 프로그램·SSL 검사로 수신이 잠깐 멈춰도 끊기지 않도록 20초(최소 15초)
+_WS_HEARTBEAT_RAW = float(os.environ.get("WS_HEARTBEAT_TIMEOUT_SEC", "20"))
+WS_HEARTBEAT_TIMEOUT_SEC = max(15.0, _WS_HEARTBEAT_RAW)
+# 재연결 백오프(초): 1 → 3 → 5 이후 5초 유지 (무한 재시도)
+WS_RECONNECT_BACKOFF_SEC = (1.0, 3.0, 5.0)
+WS_RECONNECT_RESYNC_DEBOUNCE_SEC = 3.0  # 재연결 직후 inquire_balance 동기화 최소 간격
 
 # 멀티 슬롯 · 총 시드 (고정 종목당 150만 원 폐지 → 가변 베팅)
 MAX_SIMULTANEOUS_STOCKS = 5
-ACCOUNT_INITIAL_PRINCIPAL = 10_000_000  # 디스코드 영수증 — 누적 자산 수익률(원금 대비) 기준 원금
-ACCOUNT_TOTAL_SEED = 7_500_000  # 총 운용 시드 (5슬롯 × 레거시 150만 기준)
+# 물리 슬롯 1~5 — 성격(장투/스윙/단타)은 UI 실시간 변경 · positions_state 저장
+PORTFOLIO_SLOT_DEFINITIONS = [
+    {"slot_uid": "1", "display_idx": 1},
+    {"slot_uid": "2", "display_idx": 2},
+    {"slot_uid": "3", "display_idx": 3},
+    {"slot_uid": "4", "display_idx": 4},
+    {"slot_uid": "5", "display_idx": 5},
+]
+ACCOUNT_INITIAL_PRINCIPAL = 10000000  # 디스코드 영수증 — 누적 자산 수익률(원금 대비) 기준 원금
+ACCOUNT_TOTAL_SEED = 10000000  # 총 운용 시드
 AUTO_TRADE_TOTAL_BUDGET = ACCOUNT_TOTAL_SEED  # 레거시 별칭 — 슬롯 고정금액 아님
 
 # AI 가변 베팅 (betting_engine.py)
@@ -54,8 +69,12 @@ AUTO_TRADE_SCAN_START_TIME = "09:00"
 AUTO_TRADE_SCAN_END_TIME = "15:30"
 
 # 실시간 무한 롤링 (1H 정각 타이머 없음)
-REALTIME_SCAN_INTERVAL_SEC = 15  # REST 폴백 시 재탐색 최소 간격(WS 우선)
-REALTIME_ENGINE_TICK_SEC = 2.0  # WS 미연결 시 엔진 폴링 틱
+REALTIME_SCAN_INTERVAL_SEC = 300  # 폴링 모드 신규 진입 스캔 간격(초) — 매매 빈도 완화
+REALTIME_ENGINE_TICK_SEC = 8.0  # 폴링 엔진 틱 (5~10초)
+POLLING_POSITION_INTERVAL_SEC = 8.0  # 보유 종목 가격·청산 판정
+POLLING_BALANCE_INTERVAL_SEC = 30.0  # inquire_balance 동기화
+POLLING_DAILY_BARS_CACHE_SEC = 300  # 종목별 일봉 캐시
+POLLING_DAILY_LOOKBACK_DAYS = 90
 REALTIME_UNIVERSE_REFRESH_SEC = 600  # brain 유니버스 — 10분마다만 KIS 순위/수급 스캔
 BRAIN_FLOW_CACHE_SEC = 300  # 거래대금 TOP-N + 수급 스캔 캐시 (5분)
 TRADE_RANK_CACHE_SEC = 300  # 거래대금 순위 API — 5분 캐시 (코스닥 프록시·AI 공용)
@@ -64,10 +83,11 @@ REALTIME_SCAN_BATCH_SIZE = 30  # 회전 배치(스윙 1H 검증 API 부하 분�
 SCAN_INTERVAL_SEC = REALTIME_SCAN_INTERVAL_SEC  # 레거시 별칭
 SCAN_ALIGN_TO_HOUR = False
 
-# 모드별 REST 폴백 감시(WS 연결 시 0 → 체결 틱 즉시 판정)
+# 모드별 REST 폴백 감시(폴링 모드에서는 POLLING_POSITION_INTERVAL_SEC 사용)
 SCALP_MONITOR_INTERVAL_SEC = 0.0
-SWING_MONITOR_INTERVAL_SEC = 0.0
-LONG_MONITOR_INTERVAL_SEC = 0.0
+SWING_MONITOR_INTERVAL_SEC = 8.0
+LONG_MONITOR_INTERVAL_SEC = 10.0
+POLLING_DISABLE_DAY_TRADING = True  # 폴링 모드에서 단타 진입·분봉 청산 비활성
 
 # 단타 분봉 진입·청산 (1m/3m 수급)
 SCALP_MIN_CHANGE_PCT = 2.0
@@ -86,27 +106,32 @@ SCALP_TOP_WICK_REJECT_PCT = 3.5
 SCALP_SCAN_TOP_N = 35  # 등락·거래량 상위만 분봉 심층 스캔
 SCALP_USE_MARKET_ORDER = True  # 단타 진입 시장가 우선
 
-# 스윙(테마주) — 매집·분할매수·목표 익절
-SWING_TARGET_PROFIT_PCT = 15.0
-SWING_PARTIAL_EXIT_PCT_1 = 10.0
-SWING_HARD_STOP_LOSS_PCT = 12.0
-SWING_MAX_SPLIT_BUYS = 3
-SWING_DIP_BUY_MIN_PCT = 2.5
-SWING_DIP_BUY_MAX_PCT = 8.0
-SWING_ACCUMULATION_LOOKBACK = 14
+# 스윙(테마주) — 매집·분할매수·목표 익절 (폴링·MA 확실 시만)
+SWING_TARGET_PROFIT_PCT = 18.0
+SWING_PARTIAL_EXIT_PCT_1 = 12.0
+SWING_HARD_STOP_LOSS_PCT = 15.0
+SWING_MIN_HOLD_BIZ_DAYS = 3  # 최소 보유 영업일 — 이전 조기 손절 억제
+SWING_MA_EXIT_BREAK_PCT = 2.0  # MA20 이탈 % 이하에서만 구조 손절
+SWING_ENTRY_REQUIRE_MA_ALIGNED = True
+SWING_MAX_SPLIT_BUYS = 2
+SWING_DIP_BUY_MIN_PCT = 3.0
+SWING_DIP_BUY_MAX_PCT = 10.0
+SWING_ACCUMULATION_LOOKBACK = 20
 SWING_RESCUE_REQUIRE_MA_SUPPORT = True
-SWING_RESCUE_MA_TOLERANCE_PCT = 1.0
-SWING_RESCUE_TIMEOUT_BIZ_DAYS = 3
-SWING_RESCUE_TIMEOUT_MIN_REBOUND_PCT = 1.0
+SWING_RESCUE_MA_TOLERANCE_PCT = 1.5
+SWING_RESCUE_TIMEOUT_BIZ_DAYS = 5
+SWING_RESCUE_TIMEOUT_MIN_REBOUND_PCT = 1.5
 
-# 장투(대형주) — 적립식·트레일링만
+# 장투(대형주) — 적립식·트레일링, 자주 매도하지 않음
+LONG_MIN_HOLD_BIZ_DAYS = 10  # 최소 보유 영업일(임의 청산 억제)
 LONG_DCA_INTERVAL_SEC = 86_400
-LONG_DCA_SLICE_PCT = 0.08
-LONG_MAX_DCA_ADDS = 12
-LONG_TRAIL_MIN_PEAK_PCT = 5.0
-LONG_NOISE_FILTER_PCT = 2.0
-LONG_TRAILING_TIER1_DROP_PCT = 3.0
-LONG_TRAILING_TIER2_DROP_PCT = 5.0
+LONG_DCA_SLICE_PCT = 0.06
+LONG_MAX_DCA_ADDS = 8
+LONG_TRAIL_MIN_PEAK_PCT = 8.0
+LONG_NOISE_FILTER_PCT = 4.0
+LONG_TRAILING_TIER1_DROP_PCT = 4.0
+LONG_TRAILING_TIER2_DROP_PCT = 6.0
+LONG_ENTRY_REQUIRE_MA_ALIGNED = True
 
 # 6월 마스터 테스트용 장투 시한부 강제 청산
 LONG_FORCE_EXIT_ENABLED = True
@@ -118,7 +143,7 @@ LONG_FORCE_SPLIT_INTERVAL_MIN = 10
 LONG_FORCE_SPLIT_TRANCHES = 5
 
 # 감시 / UI
-MONITOR_INTERVAL_SEC = 15  # WS 끊김 시 REST 폴백 상한(종목당 1.5초+)
+MONITOR_INTERVAL_SEC = 8  # 레거시 REST 감시 상한
 BOOT_API_STAGGER_SEC = 8  # 기동 시 AI 부트스트랩 지연(스캔과 동시 폭주 방지)
 UI_REFRESH_INTERVAL_SEC = 5
 # 상단 [오늘 통합/총 예상 수익률]·슬롯 시세 fragment 자동 갱신 (F5 불필요)
@@ -129,11 +154,15 @@ KIS_RATE_LIMIT_MAX_RETRIES = 4
 KIS_RATE_LIMIT_RETRY_SEC = 2.0
 ACCOUNT_REFRESH_SEC = 60  # 계좌 잔고 UI 갱신 주기
 ACCOUNT_SNAPSHOT_REFRESH_SEC = 45  # 백엔드 잔고 스냅샷 (체결 확인용)
-ORDER_STATUS_POLL_SEC = 10  # 체결 폴러 — 매 틱 잔고 조회 금지
+ORDER_STATUS_POLL_SEC = 10  # 체결 폴러 — 대기 주문 없을 때
+ORDER_FILL_POLL_ACTIVE_SEC = 1  # 미체결 주문 있을 때 체결 확인 주기(초)
 
 # 보유 슬롯 — 기본은 프로세스 메모리. Render Disk 등 영속 볼륨이 있으면 경로 지정.
 # 예: POSITIONS_PERSIST_PATH=/var/data/positions_state.json
 POSITIONS_PERSIST_PATH = os.environ.get("POSITIONS_PERSIST_PATH", "").strip()
+
+# 매매 체결 영구 저장 (sqlite3) — trade_state.json 과 별도
+TRADE_HISTORY_DB_PATH = os.environ.get("TRADE_HISTORY_DB_PATH", "").strip()
 
 # 무인 알림(Webhook) — 텔레그램/카카오/디스코드 연동용
 _ENABLE_RAW = str(os.environ.get("ENABLE_NOTIFICATIONS", "true")).strip().lower()
@@ -150,6 +179,11 @@ NOTIFY_MARKET_OPEN_SUMMARY_TIME = "09:05"
 NOTIFY_MARKET_OPEN_SUMMARY_WINDOW_MIN = 10  # 장시작 요약 발송 허용 구간(분)
 NOTIFY_MARKET_CLOSE_SUMMARY_TIME = "15:35"  # 일일 결산 영수증 (하루 1회)
 NOTIFY_MARKET_CLOSE_SUMMARY_WINDOW_MIN = 10  # 결산 발송 허용 구간 — 18시 재발송 방지
+# 장 마감 직후 AI 복기·시장·내일 전략 리포트
+ENABLE_DAILY_CLOSE_REPORT = True
+DAILY_CLOSE_REPORT_TIME = "15:31"  # 15:30 마감 직후
+DAILY_CLOSE_REPORT_WINDOW_MIN = 20
+ENABLE_DAILY_CLOSE_REPORT_AI = True  # GEMINI_API_KEY 있으면 내일 전략 LLM 보강
 ENABLE_AI_BRIEFING = True
 AI_BRIEFING_NEWS_HOURS = 24
 AI_BRIEFING_TOP_K = 3

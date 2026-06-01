@@ -579,7 +579,7 @@ def classify_trading_mode_auto(stock: dict[str, Any]) -> dict[str, Any]:
         ThemePhase.PRE_EXIT,
         ThemePhase.EVENT_DAY,
     ):
-        mode = TradingMode.SCALPING if vol >= vol_scalp else TradingMode.SWING
+        mode = TradingMode.DAY_TRADING if vol >= vol_scalp else TradingMode.SWING
         rationale.append(f"테마 {theme_plan.title} ({theme_plan.note})")
     elif cap >= large_cap and vol < vol_swing and (leader >= 15 or flow >= 40):
         mode = TradingMode.LONG_TERM
@@ -588,7 +588,7 @@ def classify_trading_mode_auto(stock: dict[str, Any]) -> dict[str, Any]:
         mode = TradingMode.SWING
         rationale.append("대형주 · 완만 변동 → 스윙")
     elif cap < mid_cap or vol >= vol_scalp or momentum >= 45:
-        mode = TradingMode.SCALPING if vol >= vol_scalp else TradingMode.SWING
+        mode = TradingMode.DAY_TRADING if vol >= vol_scalp else TradingMode.SWING
         rationale.append("소형/고변동/테마 → 단타·스윙")
     elif momentum >= 30:
         mode = TradingMode.SWING

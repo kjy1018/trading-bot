@@ -13,6 +13,8 @@ import time
 from datetime import date, datetime, time as dt_time, timedelta
 from typing import Any
 
+from trading_categories import normalize_trading_category
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -40,29 +42,9 @@ def _cfg_bool(name: str, default: bool) -> bool:
 
 
 def _normalize_mode_value(raw_mode: Any, fallback: str = "swing") -> str:
-    """UI/selected_modes 입력 라벨을 내부 모드값으로 정규화."""
-    text = str(raw_mode or "").strip()
-    lowered = text.lower()
-    aliases = {
-        "scalping": "scalping",
-        "scalp": "scalping",
-        "short": "scalping",
-        "danta": "scalping",
-        "단타": "scalping",
-        "swing": "swing",
-        "스윙": "swing",
-        "long_term": "long_term",
-        "longterm": "long_term",
-        "long": "long_term",
-        "jangtu": "long_term",
-        "장투": "long_term",
-    }
-    if text in aliases:
-        return aliases[text]
-    if lowered in aliases:
-        return aliases[lowered]
-    fb = aliases.get(str(fallback).lower())
-    return fb or "swing"
+    from trading_categories import normalize_trading_category
+
+    return normalize_trading_category(raw_mode, fallback=fallback)
 
 
 def _api_throttle_sleep() -> None:
@@ -147,7 +129,7 @@ def compute_expected_exit(
     mode = (trading_mode or "swing").lower()
     bars = hourly_bars or []
 
-    if mode == "scalping":
+    if mode == "day_trading":
         tp = _cfg_float("SCALP_TAKE_PROFIT_PCT", 3.0)
         target = int(round(entry * (1 + tp / 100.0)))
         return {
@@ -365,7 +347,7 @@ def get_capital_allocation() -> dict[str, float]:
 
 def _default_mode_target_pct(mode: str) -> float:
     mode = (mode or "swing").lower()
-    if mode == "scalping":
+    if mode == "day_trading":
         return _cfg_float("SCALP_TAKE_PROFIT_PCT", 3.0)
     if mode == "long_term":
         return _cfg_float("TARGET_LONG_CEILING_PCT", 20.0)
@@ -382,25 +364,39 @@ def assemble_commander_slots(
     include_control_candidates: bool = True,
 ) -> list[dict[str, Any]]:
     """
-    전황판 5슬롯 — 보유 포지션 + (선택) 슬롯에 고정된 후보만 묶음.
+    전황판 5슬롯 — slot_id 고정 레이아웃 + (선택) 빈 칸 후보만 묶음.
 
     include_control_candidates=False 이거나 슬롯이 전부 보유면
     자동 추천 풀·유니버스 종목은 절대 포함하지 않음.
     """
+    import trade_state
     from selected_modes import resolve_mode_label_for_slot, resolve_mode_value_for_slot
+    from slot_registry import build_slot_layout
     from stock_names import normalize_code
 
-    held_count = min(len(positions), max_slots)
-    if held_count >= max_slots:
+    pos_by_code: dict[str, dict[str, Any]] = {}
+    for pos in positions:
+        if not isinstance(pos, dict):
+            continue
+        code = normalize_code(pos.get("code"))
+        if len(code) == 6:
+            pos_by_code[code] = pos
+
+    layout = build_slot_layout(pos_by_code, trade_state.get_slots_book())
+    filled_count = sum(1 for cell in layout if not cell.get("is_empty"))
+    if filled_count >= max_slots:
         include_control_candidates = False
     controls: dict[int, dict[str, Any]] = {}
     if include_control_candidates and isinstance(slot_controls, dict):
         controls = slot_controls
     slots: list[dict[str, Any]] = []
 
-    for idx in range(1, max_slots + 1):
-        if idx <= held_count:
-            pos = positions[idx - 1]
+    for cell in layout:
+        idx = int(cell.get("display_idx") or 0)
+        if idx <= 0 or idx > max_slots:
+            continue
+        pos = cell.get("position") if not cell.get("is_empty") else None
+        if isinstance(pos, dict):
             code = normalize_code(pos.get("code"))
             if len(code) != 6:
                 continue
@@ -420,6 +416,8 @@ def assemble_commander_slots(
             slots.append(
                 {
                     "slot_idx": idx,
+                    "slot_id": str(cell.get("slot_id") or pos.get("slot_id") or ""),
+                    "slot_type": str(cell.get("slot_type") or pos.get("slot_type") or mode),
                     "code": code,
                     "name": str(pos.get("name") or code),
                     "is_held": True,
@@ -452,6 +450,8 @@ def assemble_commander_slots(
         slots.append(
             {
                 "slot_idx": idx,
+                "slot_id": str(cell.get("slot_id") or ""),
+                "slot_type": str(cell.get("slot_type") or mode),
                 "code": code,
                 "name": str(cand.get("name") or code),
                 "is_held": False,
@@ -479,7 +479,7 @@ def _slot_intraday_expectation(slot: dict[str, Any]) -> tuple[float, float, floa
     if slot.get("is_held"):
         cur = float(slot.get("profit_pct") or 0.0)
         tgt = float(slot.get("target_profit_pct") or _default_mode_target_pct(mode))
-        if mode == "scalping":
+        if mode == "day_trading":
             stop = _cfg_float("SCALP_STOP_LOSS_PCT", 1.5)
             low = max(cur - stop, -stop)
             high = min(max(tgt, cur + 0.25), _cfg_float("SCALP_TAKE_PROFIT_PCT", 3.0) + 0.5)
@@ -492,7 +492,7 @@ def _slot_intraday_expectation(slot: dict[str, Any]) -> tuple[float, float, floa
     else:
         chg = float(slot.get("change_rate") or 0.0)
         tgt = float(slot.get("target_profit_pct") or _default_mode_target_pct(mode))
-        if mode == "scalping":
+        if mode == "day_trading":
             stop = _cfg_float("SCALP_STOP_LOSS_PCT", 1.5)
             low = chg - stop + bias
             high = chg + _cfg_float("SCALP_TAKE_PROFIT_PCT", 3.0) + bias
@@ -744,7 +744,15 @@ def format_target_line_for_ui(position: dict[str, Any]) -> str:
 
 
 def position_trading_mode(position: dict[str, Any]) -> str:
-    """포지션 청산·감시 — selected_modes.json 사용자 설정 우선."""
+    """포지션 청산·감시 — slots book 실시간 슬롯 성격 최우선."""
+    try:
+        from slot_registry import resolve_live_trading_mode_for_position
+
+        return normalize_trading_category(
+            resolve_live_trading_mode_for_position(position)
+        )
+    except ImportError:
+        pass
     try:
         from selected_modes import get_mode_value_for_position
 
@@ -753,8 +761,17 @@ def position_trading_mode(position: dict[str, Any]) -> str:
         return _normalize_mode_value(position.get("trading_mode"), "swing")
 
 
+def is_polling_strategy_mode() -> bool:
+    """스윙/장투 폴링 전용 — WS 단타 틱 비활성."""
+    if _cfg_bool("POLLING_STRATEGY_MODE", False):
+        return True
+    return not _cfg_bool("USE_REALTIME_WEBSOCKET", True)
+
+
 def monitor_interval_for_positions(positions: list[dict[str, Any]]) -> float:
-    """REST 폴백 감시 주기(초). WS 연결 시 0 → 체결 틱이 즉시 판정."""
+    """REST 폴백·폴링 감시 주기(초)."""
+    if is_polling_strategy_mode():
+        return _cfg_float("POLLING_POSITION_INTERVAL_SEC", 8.0)
     if _cfg_bool("USE_REALTIME_WEBSOCKET", True):
         try:
             from scheduler import _realtime_ws_ready
@@ -764,7 +781,7 @@ def monitor_interval_for_positions(positions: list[dict[str, Any]]) -> float:
         except Exception:
             pass
     modes = {position_trading_mode(p) for p in positions}
-    if "scalping" in modes:
+    if "day_trading" in modes:
         return _cfg_float("SCALP_MONITOR_INTERVAL_SEC", 1.0)
     if "long_term" in modes:
         return _cfg_float("LONG_MONITOR_INTERVAL_SEC", 8.0)
@@ -772,15 +789,64 @@ def monitor_interval_for_positions(positions: list[dict[str, Any]]) -> float:
 
 
 def requires_fast_tick_exit(position: dict[str, Any]) -> bool:
-    return position_trading_mode(position) == "scalping"
+    if is_polling_strategy_mode():
+        return False
+    return position_trading_mode(position) == "day_trading"
 
 
 def requires_minute_bars(position: dict[str, Any]) -> bool:
-    return position_trading_mode(position) == "scalping"
+    if is_polling_strategy_mode():
+        return False
+    return position_trading_mode(position) == "day_trading"
 
 
 def requires_hourly_bars(position: dict[str, Any]) -> bool:
+    if is_polling_strategy_mode():
+        return position_trading_mode(position) in ("swing", "long_term")
     return position_trading_mode(position) in ("swing", "long_term")
+
+
+def requires_daily_bars(position: dict[str, Any]) -> bool:
+    return is_polling_strategy_mode() and position_trading_mode(position) in (
+        "swing",
+        "long_term",
+    )
+
+
+def _ma_bundle_from_daily(daily_bars: list[dict[str, Any]] | None) -> dict[str, Any]:
+    if not daily_bars:
+        return {}
+    try:
+        from stock_daily import compute_ma_bundle
+
+        closes = [int(b.get("close") or 0) for b in daily_bars]
+        return compute_ma_bundle(closes)
+    except Exception:
+        return {}
+
+
+def passes_polling_entry_ma_filter(
+    mode: str,
+    daily_bars: list[dict[str, Any]] | None,
+) -> bool:
+    """폴링 모드 — MA 정배열·가격이 MA20 위일 때만 진입."""
+    mode = _normalize_mode_value(mode, "swing")
+    if not is_polling_strategy_mode():
+        return True
+    if mode == "day_trading":
+        return False
+    bundle = _ma_bundle_from_daily(daily_bars)
+    if not bundle:
+        return False
+    ma20 = bundle.get("ma20")
+    last = bundle.get("last_close")
+    if ma20 is None or last is None:
+        return False
+    if mode == "long_term" and _cfg_bool("LONG_ENTRY_REQUIRE_MA_ALIGNED", True):
+        return bool(bundle.get("ma_aligned")) and float(last) >= float(ma20)
+    if mode == "swing" and _cfg_bool("SWING_ENTRY_REQUIRE_MA_ALIGNED", True):
+        return bool(bundle.get("ma_aligned")) and float(last) >= float(ma20) * 0.98
+    return float(last) >= float(ma20)
 
 
 def get_entry_stop_loss(entry_price: int, mode: str) -> int:
@@ -789,7 +855,7 @@ def get_entry_stop_loss(entry_price: int, mode: str) -> int:
     if entry <= 0:
         return 0
     mode = _normalize_mode_value(mode, "swing")
-    if mode == "scalping":
+    if mode == "day_trading":
         sl = _cfg_float("SCALP_STOP_LOSS_PCT", 1.5)
         return int(round(entry * (1 - sl / 100.0)))
     return 0
@@ -804,7 +870,7 @@ def apply_tactical_fields_on_position(position: dict[str, Any]) -> dict[str, Any
     position.setdefault("swing_exit_stage", 0)
     position.setdefault("dca_count", 0)
     position["stop_loss_price"] = get_entry_stop_loss(entry, mode)
-    if mode == "scalping":
+    if mode == "day_trading":
         position["scalp_entry_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         position["pyramid_done"] = True
     elif mode == "swing":
@@ -1101,11 +1167,25 @@ def decide_swing_exit(
     profit_pct: float,
     *,
     hourly_bars: list[dict] | None = None,
+    daily_bars: list[dict] | None = None,
 ) -> str | None:
     """스윙·테마 — 매집 하단 이탈 + 고정 손절선 기준으로만 청산."""
     entry = int(pos.get("entry_price") or 0)
     if entry <= 0:
         return None
+
+    min_hold = max(0, _cfg_int("SWING_MIN_HOLD_BIZ_DAYS", 3))
+    held_biz = _biz_days_since(str(pos.get("entry_date") or pos.get("updated_at") or ""))
+    early_exit_allowed = held_biz >= min_hold
+
+    bars = hourly_bars
+    if is_polling_strategy_mode() and daily_bars:
+        try:
+            from stock_daily import daily_bars_as_hourly_proxy
+
+            bars = daily_bars_as_hourly_proxy(daily_bars)
+        except Exception:
+            bars = hourly_bars
 
     if pos.get("theme_prepare_exit"):
         if profit_pct >= _cfg_float("SWING_PARTIAL_EXIT_PCT_1", 10.0):
@@ -1127,24 +1207,31 @@ def decide_swing_exit(
         pos["trailing_drop_pct"] = 2.5
         return None
 
-    zone = compute_swing_accumulation_zone(hourly_bars, entry)
+    zone = compute_swing_accumulation_zone(bars, entry)
     if zone and current >= zone["support"]:
         # 조정·눌림 — 패닉 손절 없음 (분할매수는 plan_position_add)
         pass
-    elif zone and current < zone["support"] * 0.97:
+    elif early_exit_allowed and zone and current < zone["support"] * 0.97:
         if profit_pct <= -hard_stop:
             return f"스윙 매집 하단 이탈 손절 (-{hard_stop:.1f}%)"
+
+    if early_exit_allowed and is_polling_strategy_mode() and daily_bars:
+        bundle = _ma_bundle_from_daily(daily_bars)
+        ma20 = bundle.get("ma20")
+        break_pct = _cfg_float("SWING_MA_EXIT_BREAK_PCT", 2.0)
+        if ma20 and current < float(ma20) * (1 - break_pct / 100.0):
+            if profit_pct <= -hard_stop * 0.6:
+                return f"스윙 MA20 이탈 구조 손절 ({profit_pct:+.1f}%)"
 
     kind = str(pos.get("target_kind") or "limit")
     target = int(pos.get("target_price") or 0)
     if kind != "trailing" and target > entry and current >= target:
         return "스윙 매물대 목표 익절"
     # 구출(분할매수) 이후에도 반등 없이 기한 초과면 즉시 손절.
-    if int(pos.get("swing_add_count") or 0) > 0:
-        held_biz = _biz_days_since(str(pos.get("entry_date") or pos.get("updated_at") or ""))
+    if early_exit_allowed and int(pos.get("swing_add_count") or 0) > 0:
         if held_biz >= rescue_timeout and profit_pct < rebound_min and current <= entry:
             return f"스윙 구출 실패 Time/Trend 청산 ({held_biz}영업일)"
-    if profit_pct <= -hard_stop:
+    if early_exit_allowed and profit_pct <= -hard_stop:
         return f"스윙 고정 손절 (-{hard_stop:.1f}%)"
     return None
 
@@ -1153,6 +1240,8 @@ def decide_long_term_exit(
     pos: dict[str, Any],
     current: int,
     profit_pct: float,
+    *,
+    daily_bars: list[dict[str, Any]] | None = None,
 ) -> str | None:
     """장투 — 일일 소음 무시, 손절 없음, 트레일링 익절만."""
     stage = _long_force_liquidation_stage()
@@ -1164,6 +1253,16 @@ def decide_long_term_exit(
     entry = int(pos.get("entry_price") or 0)
     if entry <= 0:
         return None
+
+    min_hold = max(0, _cfg_int("LONG_MIN_HOLD_BIZ_DAYS", 10))
+    if _biz_days_since(str(pos.get("entry_date") or pos.get("updated_at") or "")) < min_hold:
+        return None
+
+    if is_polling_strategy_mode() and daily_bars:
+        bundle = _ma_bundle_from_daily(daily_bars)
+        ma60 = bundle.get("ma60")
+        if ma60 and current < float(ma60) * 0.92 and profit_pct < -8.0:
+            return "장투 MA60 붕괴 방어 청산"
 
     noise = _cfg_float("LONG_NOISE_FILTER_PCT", 2.0)
     peak = int(pos.get("peak_price") or entry)
@@ -1216,7 +1315,7 @@ def plan_position_add(
     if entry <= 0 or current <= 0 or available <= 0:
         return None
 
-    if mode == "scalping":
+    if mode == "day_trading":
         return None
 
     if mode == "swing":
@@ -1297,19 +1396,26 @@ def decide_position_exit(
     *,
     minute_bars: list[dict] | None = None,
     hourly_bars: list[dict] | None = None,
+    daily_bars: list[dict] | None = None,
 ) -> str | None:
     """모드별 실시간 청산 — selected_modes.json 인격 분기."""
     mode = _normalize_mode_value(position_trading_mode(pos), "swing")
     entry = int(pos.get("entry_price") or 0)
 
-    if mode == "scalping":
+    if mode == "day_trading" and not is_polling_strategy_mode():
         return decide_scalping_exit(
             pos, current, profit_pct, minute_bars=minute_bars
         )
     if mode == "long_term":
-        return decide_long_term_exit(pos, current, profit_pct)
+        return decide_long_term_exit(
+            pos, current, profit_pct, daily_bars=daily_bars
+        )
     return decide_swing_exit(
-        pos, current, profit_pct, hourly_bars=hourly_bars
+        pos,
+        current,
+        profit_pct,
+        hourly_bars=hourly_bars,
+        daily_bars=daily_bars,
     )
 
 
@@ -1460,11 +1566,16 @@ def finalize_order_fill_dashboard_sync(
             return
         for key in (
             "runtime_positions",
+            "runtime_slot_layout",
             "runtime_account",
             "runtime_account_updated_at",
+            "runtime_state_revision",
             "commander_metrics",
             "commander_metrics_sig",
             "positions_display",
+            "positions_last_ok_at",
+            "ui_scheduler_sig",
+            "ui_dashboard_refresh_nonce",
         ):
             st.session_state.pop(key, None)
         st.rerun()

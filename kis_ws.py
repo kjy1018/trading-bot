@@ -1,14 +1,13 @@
 """
 한국투자증권 국내주식 실시간 체결가 WebSocket (H0STCNT0).
 REST 폴링 없이 체결 틱마다 가격 전달 → 초당 호출 제한 회피.
-Heartbeat: N초간 수신 없으면 close() 후 재연결.
+Heartbeat: N초간 수신 없으면 close() 후 무한 재연결(1s→3s→5s 백오프).
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import random
 import threading
 import time
 from typing import Any, Callable
@@ -34,9 +33,23 @@ except ImportError:
 
 
 def _heartbeat_timeout_sec() -> float:
+    """수신 공백 허용 시간 — 보안 SW 지연 고려, 최소 15초."""
     if _cfg is None:
-        return 5.0
-    return float(getattr(_cfg, "WS_HEARTBEAT_TIMEOUT_SEC", 5.0))
+        return 20.0
+    raw = float(getattr(_cfg, "WS_HEARTBEAT_TIMEOUT_SEC", 20.0))
+    return max(15.0, raw)
+
+
+def _reconnect_backoff_steps() -> tuple[float, ...]:
+    """재연결 대기 — 1초 → 3초 → 5초, 이후 5초 유지."""
+    if _cfg is None:
+        return (1.0, 3.0, 5.0)
+    raw = getattr(_cfg, "WS_RECONNECT_BACKOFF_SEC", (1.0, 3.0, 5.0))
+    if isinstance(raw, (list, tuple)) and raw:
+        steps = tuple(float(x) for x in raw if float(x) > 0)
+        if steps:
+            return steps
+    return (1.0, 3.0, 5.0)
 
 
 def fetch_websocket_approval(rest_base: str, app_key: str, app_secret: str) -> str:
@@ -92,6 +105,7 @@ class KisRealtimeHub:
         app_secret: str,
         on_trade: Callable[[str, int], None],
         on_status: Callable[[str, str | None], None] | None = None,
+        on_reconnected: Callable[[], None] | None = None,
         heartbeat_timeout_sec: float | None = None,
     ) -> None:
         self._ws_url = ws_url
@@ -100,6 +114,7 @@ class KisRealtimeHub:
         self._app_secret = app_secret
         self._on_trade = on_trade
         self._on_status = on_status
+        self._on_reconnected = on_reconnected
         self._heartbeat_timeout = float(
             heartbeat_timeout_sec
             if heartbeat_timeout_sec is not None
@@ -122,6 +137,11 @@ class KisRealtimeHub:
         self._last_trade_at: float = 0.0
         self._reconnecting = False
         self._opened_once = False
+        self._reconnect_attempts = 0
+        self._was_connected = False
+        self._pending_resync = False
+        self._resync_callback_lock = threading.Lock()
+        self._resync_callback_running = False
 
     def _touch_rx(self) -> None:
         self._last_rx_at = time.time()
@@ -196,17 +216,51 @@ class KisRealtimeHub:
         self._status_label = msg
         if err:
             self._last_error = err
+        else:
+            self._last_error = None
         if self._on_status:
             try:
                 self._on_status(msg, err)
             except Exception:
                 logger.exception("ws on_status")
 
-    def _force_reconnect(self, reason: str) -> None:
+    def _mark_disconnected(self) -> None:
+        """끊김 표시 — 재연결 시 REST 잔고 동기화 플래그."""
+        if self._was_connected:
+            self._pending_resync = True
+        self._was_connected = False
         self._connected = False
         self._reconnecting = True
-        logger.warning("ws heartbeat timeout — reconnect: %s", reason)
-        self._emit("WS 연결 끊김 (재연결 중...)", reason)
+        self._approval_key = None
+
+    def _fire_reconnected_callback(self) -> None:
+        """재연결 직후 콜백(별도 스레드) — inquire_balance 동기화 등."""
+        if not self._on_reconnected:
+            return
+        with self._resync_callback_lock:
+            if self._resync_callback_running:
+                return
+            self._resync_callback_running = True
+
+        def _run() -> None:
+            try:
+                self._on_reconnected()
+            except Exception:
+                logger.exception("ws on_reconnected callback")
+            finally:
+                with self._resync_callback_lock:
+                    self._resync_callback_running = False
+
+        threading.Thread(
+            target=_run,
+            name="kis-ws-post-reconnect",
+            daemon=True,
+        ).start()
+
+    def _force_reconnect(self, reason: str) -> None:
+        logger.debug("ws heartbeat timeout — reconnect: %s", reason)
+        self._emit("WS 연결 끊김 (재연결 중...)", None)
+        self._mark_disconnected()
         self._safe_ws_close(self._ws_app, context="heartbeat")
 
     def _heartbeat_loop(self) -> None:
@@ -226,8 +280,30 @@ class KisRealtimeHub:
                 )
 
     def _next_reconnect_delay(self) -> float:
-        """재연결 루프 과열 방지: 30~60초 랜덤 강제 대기."""
-        return float(random.randint(30, 60))
+        """
+        지수 백오프 — 1초 → 3초 → 5초, 이후 5초 유지.
+        무한 재시도(상한 없음).
+        """
+        steps = _reconnect_backoff_steps()
+        idx = min(self._reconnect_attempts, len(steps) - 1)
+        delay = steps[idx]
+        self._reconnect_attempts += 1
+        if self._reconnect_attempts == 1 or self._reconnect_attempts % 20 == 0:
+            logger.info(
+                "ws 재연결 대기 %.1fs (시도 %d회)",
+                delay,
+                self._reconnect_attempts,
+            )
+        else:
+            logger.debug(
+                "ws 재연결 대기 %.1fs (시도 %d회)",
+                delay,
+                self._reconnect_attempts,
+            )
+        return delay
+
+    def _reset_reconnect_backoff(self) -> None:
+        self._reconnect_attempts = 0
 
     def start(self) -> bool:
         if not _HAS_WS:
@@ -250,7 +326,8 @@ class KisRealtimeHub:
 
     def stop(self) -> None:
         self._running = False
-        self._connected = False
+        self._mark_disconnected()
+        self._pending_resync = False
         self._safe_ws_close(self._ws_app, context="stop")
 
     def _approval(self) -> str:
@@ -338,12 +415,20 @@ class KisRealtimeHub:
                 def on_open(ws: websocket.WebSocketApp) -> None:
                     if ws is None:
                         return
+                    need_resync = hub._pending_resync
+                    hub._pending_resync = False
                     hub._connected = True
+                    hub._was_connected = True
                     hub._opened_once = True
                     hub._reconnecting = False
+                    hub._reset_reconnect_backoff()
                     hub._connected_at = time.time()
                     hub._last_rx_at = 0.0
-                    hub._emit("WS 연결됨 · 수신 대기", None)
+                    if need_resync:
+                        hub._emit("WS 재연결됨 · 잔고 동기화 중", None)
+                        hub._fire_reconnected_callback()
+                    else:
+                        hub._emit("WS 연결됨 · 수신 대기", None)
                     hub._sync(ws)
 
                 def on_message(ws: websocket.WebSocketApp, message: str) -> None:
@@ -377,17 +462,19 @@ class KisRealtimeHub:
                         hub._sync(ws)
 
                 def on_error(ws: websocket.WebSocketApp, error: object) -> None:
-                    hub._connected = False
-                    hub._reconnecting = True
                     err = str(error)
-                    logger.warning("ws error: %s", err)
-                    hub._emit("WS 연결 끊김 (재연결 중...)", err)
+                    logger.debug("ws on_error (재연결 예정): %s", err)
+                    hub._emit("WS 연결 끊김 (재연결 중...)", None)
+                    hub._mark_disconnected()
 
                 def on_close(ws, code, msg) -> None:
-                    hub._connected = False
-                    hub._reconnecting = True
-                    detail = str(msg) if msg else None
-                    hub._emit("WS 연결 끊김 (재연결 중...)", detail)
+                    logger.debug(
+                        "ws on_close code=%s msg=%s (재연결 예정)",
+                        code,
+                        msg,
+                    )
+                    hub._emit("WS 연결 끊김 (재연결 중...)", None)
+                    hub._mark_disconnected()
 
                 hub._ws_app = websocket.WebSocketApp(
                     hub._ws_url,
@@ -398,16 +485,12 @@ class KisRealtimeHub:
                 )
                 hub._ws_app.run_forever(ping_interval=60, ping_timeout=30)
             except Exception as exc:
-                hub._connected = False
-                hub._reconnecting = True
-                logger.exception("ws run_forever")
-                hub._emit("WS 연결 끊김 (재연결 중...)", str(exc))
+                logger.debug("ws run_forever 종료 — 재연결 예정: %s", exc)
+                hub._emit("WS 연결 끊김 (재연결 중...)", None)
+                hub._mark_disconnected()
             if not hub._running:
                 break
             delay = hub._next_reconnect_delay()
             hub._reconnecting = True
-            hub._emit(
-                "WS 연결 끊김 (재연결 대기)",
-                f"{hub._last_error or '연결 거부/종료'} · {delay:.0f}초 후 재시도",
-            )
+            hub._emit("WS 재연결 대기 중...", None)
             time.sleep(delay)

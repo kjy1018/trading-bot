@@ -455,6 +455,94 @@ def _short_title(title: str, max_len: int = 15) -> str:
     return t[:max_len] + "..."
 
 
+def make_daily_close_report_embed(report: dict[str, Any]) -> discord.Embed:
+    """장 마감 AI 복기·시장·내일 전략 임베드."""
+    review = report.get("review") or {}
+    indices = report.get("indices") or {}
+    holdings = report.get("holdings_ma") or []
+    day = str(report.get("trade_date") or "")
+
+    review_lines = [
+        f"매수 {review.get('buy_count', 0)} · 매도 {review.get('sell_count', 0)} · "
+        f"실현 {int(review.get('realized_pnl', 0)):+,}원"
+    ]
+    if review.get("sell_count", 0) > 0:
+        review_lines.append(
+            f"평균 {review.get('avg_sell_pct', 0):+.2f}% · "
+            f"승{review.get('win_count', 0)}/패{review.get('loss_count', 0)}"
+        )
+    for p in (review.get("patterns") or [])[:4]:
+        review_lines.append(f"· {p}")
+    if not review.get("trades"):
+        review_lines = ["당일 체결 없음"]
+
+    ix_lines: list[str] = []
+    for label in ("KOSPI", "KOSDAQ", "NASDAQ"):
+        ix = indices.get(label) or {}
+        chg = ix.get("change_pct")
+        px = ix.get("price")
+        if chg is not None and px is not None:
+            ix_lines.append(f"{label} {px:,.0f} ({chg:+.2f}%)")
+        else:
+            ix_lines.append(f"{label} —")
+
+    hold_lines: list[str] = []
+    for h in holdings[:6]:
+        hold_lines.append(
+            f"{h.get('name')} {float(h.get('profit_pct', 0)):+.1f}% · "
+            f"{h.get('ma_position_label', '-')}"
+        )
+    if not hold_lines:
+        hold_lines.append("보유 없음")
+
+    strategy = str(report.get("tomorrow_strategy") or "-")[:900]
+    ai_tag = " · AI" if report.get("tomorrow_ai") else ""
+
+    embed = discord.Embed(
+        title=f"📋 장 마감 리포트 ({day})",
+        description=f"생성 {report.get('generated_at', '')}{ai_tag}",
+        color=0x9B59B6,
+    )
+    embed.add_field(
+        name="1️⃣ 오늘의 복기",
+        value="\n".join(review_lines)[:1024],
+        inline=False,
+    )
+    embed.add_field(
+        name="2️⃣ 시장·보유 MA",
+        value=("\n".join(ix_lines) + "\n—\n" + "\n".join(hold_lines))[:1024],
+        inline=False,
+    )
+    embed.add_field(
+        name="3️⃣ 내일 전략",
+        value=strategy[:1024],
+        inline=False,
+    )
+    return embed
+
+
+def send_daily_close_report_embed(report: dict[str, Any]) -> None:
+    embed = make_daily_close_report_embed(report)
+    if _loop is None or _client is None or _channel_id is None:
+        return
+
+    async def _send() -> None:
+        channel = _client.get_channel(_channel_id)
+        if channel is None:
+            try:
+                channel = await _client.fetch_channel(_channel_id)
+            except Exception:
+                return
+        if channel is None:
+            return
+        await channel.send(embed=embed)
+
+    try:
+        asyncio.run_coroutine_threadsafe(_send(), _loop)
+    except Exception as exc:
+        logger.debug("장마감 리포트 디스코드 전송 실패: %s", exc)
+
+
 def _format_news_links(news_links: list[dict[str, str]] | None) -> str:
     try:
         rows = news_links or []

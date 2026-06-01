@@ -18,19 +18,19 @@ logger = logging.getLogger(__name__)
 
 
 class TradingMode(str, Enum):
-    SCALPING = "scalping"
+    DAY_TRADING = "day_trading"
     SWING = "swing"
     LONG_TERM = "long_term"
 
 
 MODE_LABEL_KO: dict[TradingMode, str] = {
-    TradingMode.SCALPING: "단타",
+    TradingMode.DAY_TRADING: "단타",
     TradingMode.SWING: "스윙",
     TradingMode.LONG_TERM: "장투",
 }
 
 MODE_BADGE_CSS: dict[TradingMode, str] = {
-    TradingMode.SCALPING: "mode-scalping",
+    TradingMode.DAY_TRADING: "mode-day-trading",
     TradingMode.SWING: "mode-swing",
     TradingMode.LONG_TERM: "mode-longterm",
 }
@@ -49,7 +49,7 @@ class ModePolicy:
 
 
 MODE_POLICIES: dict[TradingMode, ModePolicy] = {
-    TradingMode.SCALPING: ModePolicy(
+    TradingMode.DAY_TRADING: ModePolicy(
         chart_timeframe="1m/3m",
         hold_days_min=0,
         hold_days_max=0,
@@ -74,6 +74,8 @@ MODE_POLICIES: dict[TradingMode, ModePolicy] = {
         description="장기 홀딩 · 메가 트렌드",
     ),
 }
+
+TradingMode.SCALPING = TradingMode.DAY_TRADING  # 레거시 import 호환
 
 
 @dataclass
@@ -335,7 +337,7 @@ class BrainClassifier:
         self.scalp_vol_min_pct = scalp_vol_min_pct
         self.long_term_min_cap = long_term_min_cap
         self._rules: dict[TradingMode, list[ModeRule]] = {
-            TradingMode.SCALPING: [
+            TradingMode.DAY_TRADING: [
                 ScalpingVolumeExplosionRule(scalp_vol_min_pct),
                 ScalpingExecutionStrengthRule(),
             ],

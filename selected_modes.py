@@ -19,7 +19,7 @@ SELECTED_MODES_FILE = PROJECT_DIR / "selected_modes.json"
 
 MODE_LABELS: tuple[str, ...] = ("단타", "스윙", "장투")
 LABEL_TO_VALUE: dict[str, str] = {
-    "단타": "scalping",
+    "단타": "day_trading",
     "스윙": "swing",
     "장투": "long_term",
 }

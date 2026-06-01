@@ -1,7 +1,6 @@
 """
-영구 저장 — trade_state.json (당일 청산 영수증).
+영구 저장 — trade_history.db (체결·실현손익), trade_state.json (AI·UI 모드 등 부가 설정).
 보유 슬롯(positions)은 프로세스 메모리가 기준 — Render ephemeral FS 회피.
-선택: POSITIONS_PERSIST_PATH 환경변수(Render Disk 등)에만 비동기 백업.
 """
 
 from __future__ import annotations
@@ -13,12 +12,16 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import trade_history_db as _trade_db
+
 PROJECT_DIR = Path(__file__).resolve().parent
 TRADE_STATE_FILE = PROJECT_DIR / "trade_state.json"
+TRADE_HISTORY_DB_FILE = _trade_db.trade_history_db_path()
 POSITIONS_STATE_FILE = PROJECT_DIR / "positions_state.json"  # 레거시 부트스트랩용
 
 _lock = threading.RLock()
 _runtime_positions: dict[str, dict[str, Any]] = {}
+_runtime_slots: dict[str, dict[str, Any]] = {}
 _runtime_revision: int = 0
 _positions_bootstrapped: bool = False
 _dashboard_refresh_nonce: int = 0
@@ -100,7 +103,10 @@ def _default_daily() -> dict[str, Any]:
 
 
 def _default_positions_file() -> dict[str, Any]:
-    return {"positions": {}}
+    from slot_registry import default_slots_book, serialize_slot_portfolio_file
+
+    slots = default_slots_book()
+    return serialize_slot_portfolio_file({}, slots)
 
 
 def _save_json(path: Path, data: dict[str, Any]) -> None:
@@ -121,40 +127,64 @@ def _load_json(path: Path) -> dict[str, Any]:
         return {}
 
 
-def _read_positions_from_path(path: Path) -> dict[str, dict[str, Any]]:
+def _read_portfolio_from_path(path: Path) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    from slot_registry import load_portfolio_file
+
     data = _load_json(path)
-    raw = data.get("positions") if isinstance(data, dict) else None
-    if not isinstance(raw, dict):
-        return {}
-    return {str(k): dict(v) for k, v in raw.items() if isinstance(v, dict)}
+    return load_portfolio_file(data)
 
 
-def _maybe_persist_positions_to_disk(positions: dict[str, dict[str, Any]]) -> None:
+def _read_positions_from_path(path: Path) -> dict[str, dict[str, Any]]:
+    positions, _ = _read_portfolio_from_path(path)
+    return positions
+
+
+def _maybe_persist_positions_to_disk(
+    positions: dict[str, dict[str, Any]],
+    slots: dict[str, dict[str, Any]] | None = None,
+) -> None:
     """선택적 디스크 백업 — POSITIONS_PERSIST_PATH 설정 시에만."""
     path = _positions_persist_path()
     if path is None:
         return
     try:
+        from slot_registry import normalize_slots_book, serialize_slot_portfolio_file
+
         path.parent.mkdir(parents=True, exist_ok=True)
-        _save_json(path, {"positions": positions})
+        norm_slots = normalize_slots_book(slots) if slots is not None else {}
+        payload = serialize_slot_portfolio_file(positions, norm_slots)
+        _save_json(path, payload)
     except OSError:
         pass
 
 
 def _bootstrap_runtime_positions_once() -> None:
-    global _positions_bootstrapped, _runtime_positions
+    global _positions_bootstrapped, _runtime_positions, _runtime_slots
     if _positions_bootstrapped:
         return
     _positions_bootstrapped = True
+    from slot_registry import (
+        assign_legacy_positions_to_slots,
+        default_slots_book,
+        normalize_slots_book,
+        sync_slots_with_positions,
+    )
+
     loaded: dict[str, dict[str, Any]] = {}
+    slots = default_slots_book()
     persist_path = _positions_persist_path()
     if persist_path is not None and persist_path.is_file():
-        loaded = _read_positions_from_path(persist_path)
+        loaded, slots = _read_portfolio_from_path(persist_path)
     elif POSITIONS_STATE_FILE.is_file():
-        loaded = _read_positions_from_path(POSITIONS_STATE_FILE)
+        loaded, slots = _read_portfolio_from_path(POSITIONS_STATE_FILE)
     if loaded:
         _runtime_positions = {k: dict(v) for k, v in loaded.items()}
+        assign_legacy_positions_to_slots(slots, _runtime_positions)
+        sync_slots_with_positions(slots, _runtime_positions)
+        _runtime_slots = normalize_slots_book(slots)
         _bump_positions_revision()
+    else:
+        _runtime_slots = normalize_slots_book(slots)
 
 
 def _normalize_daily_data(data: dict[str, Any]) -> dict[str, Any]:
@@ -185,9 +215,11 @@ def _ensure_daily_unlocked() -> dict[str, Any]:
     if not TRADE_STATE_FILE.is_file():
         data = _default_daily()
         _save_json(TRADE_STATE_FILE, data)
+        _init_trade_history()
         return _ensure_ai_forecast_block(_ensure_weekly_block(data))
 
     data = _normalize_daily_data(_load_json(TRADE_STATE_FILE))
+    _maybe_migrate_json_trades_to_db(data)
     if data.get("date") != today:
         preserved_weekly = data.get("weekly") if isinstance(data.get("weekly"), dict) else None
         preserved_ai_weekly = None
@@ -215,6 +247,7 @@ def _ensure_daily_unlocked() -> dict[str, Any]:
     data = _normalize_daily_data(data)
     data.setdefault("weekly", _default_weekly())
     data = _ensure_weekly_block(data)
+    _maybe_migrate_json_trades_to_db(data)
     return _ensure_ai_forecast_block(data)
 
 
@@ -241,6 +274,102 @@ def _ensure_weekly_block(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def _maybe_migrate_json_trades_to_db(data: dict[str, Any]) -> None:
+    """레거시 completed_trades → sqlite (1회)."""
+    legacy = data.get("completed_trades")
+    if not isinstance(legacy, list) or not legacy:
+        return
+    try:
+        n = _trade_db.migrate_completed_trades_from_json(legacy)
+        if n:
+            logger = __import__("logging").getLogger(__name__)
+            logger.info("trade_history.db: JSON 영수증 %d건 이전 완료", n)
+    except Exception:
+        pass
+
+
+def _init_trade_history() -> None:
+    _trade_db.init_trade_history_db()
+
+
+def save_account_snapshot_for_charts(
+    account_total_eval: int,
+    *,
+    stock_eval: int = 0,
+    cash: int = 0,
+    snapshot_date: str | None = None,
+) -> None:
+    """대시보드 누적 자산 곡선용 — trade_history.db."""
+    with _lock:
+        _init_trade_history()
+        _trade_db.save_account_snapshot(
+            account_total_eval,
+            stock_eval=stock_eval,
+            cash=cash,
+            snapshot_date=snapshot_date,
+        )
+
+
+def get_performance_chart_series(
+    *,
+    initial_principal: int,
+    live_account_total: int | None = None,
+) -> dict[str, Any]:
+    _init_trade_history()
+    return _trade_db.build_performance_chart_series(
+        initial_principal=initial_principal,
+        live_account_total=live_account_total,
+    )
+
+
+def save_trade_record(
+    *,
+    stock_name: str,
+    side: str,
+    price: int,
+    quantity: int,
+    trade_date: str | None = None,
+    trade_time: str | None = None,
+    stock_code: str = "",
+    pnl: int | None = None,
+    profit_pct: float | None = None,
+    exit_type: str | None = None,
+) -> int:
+    """체결 1건 — trade_history.db 영구 저장."""
+    with _lock:
+        _init_trade_history()
+        return _trade_db.save_trade_record(
+            stock_name=stock_name,
+            side=side,
+            price=price,
+            quantity=quantity,
+            trade_date=trade_date,
+            trade_time=trade_time,
+            stock_code=stock_code,
+            pnl=pnl,
+            profit_pct=profit_pct,
+            exit_type=exit_type,
+        )
+
+
+def _daily_totals_from_db(trade_date: str | None = None) -> tuple[int, int, str]:
+    """당일 청산 건수·실현손익 — DB 기준 (trade_state.json 불필요)."""
+    _init_trade_history()
+    day = trade_date or date.today().isoformat()
+    agg = _trade_db.aggregate_daily(day)
+    return (
+        int(agg.get("trade_count") or agg.get("sell_count") or 0),
+        int(agg.get("total_pnl") or 0),
+        day,
+    )
+
+
+def _weekly_totals_from_db(week_start: str | None = None) -> dict[str, Any]:
+    _init_trade_history()
+    start = week_start or _monday_of().isoformat()
+    return _trade_db.aggregate_week(start)
+
+
 def _parse_trade_datetime(value: str) -> datetime | None:
     text = str(value or "").strip()
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
@@ -258,10 +387,57 @@ def ensure_trade_state_file() -> dict[str, Any]:
 
 
 def ensure_positions_file() -> dict[str, Any]:
-    """레거시 API — 메모리 포지션 스토어 초기화."""
+    """레거시 API — slot_id 키 포트폴리오 스냅샷."""
+    from slot_registry import serialize_slot_portfolio_file
+
     with _lock:
         _bootstrap_runtime_positions_once()
-        return {"positions": {k: dict(v) for k, v in _runtime_positions.items()}}
+        return serialize_slot_portfolio_file(
+            {k: dict(v) for k, v in _runtime_positions.items()},
+            {k: dict(v) for k, v in _runtime_slots.items()},
+        )
+
+
+def get_slots_book() -> dict[str, dict[str, Any]]:
+    with _lock:
+        _bootstrap_runtime_positions_once()
+        return {k: dict(v) for k, v in _runtime_slots.items()}
+
+
+def save_portfolio_state(
+    positions: dict[str, dict[str, Any]],
+    slots: dict[str, dict[str, Any]],
+) -> None:
+    from slot_registry import normalize_slots_book, sync_slots_with_positions
+
+    with _lock:
+        _bootstrap_runtime_positions_once()
+        norm_slots = normalize_slots_book(slots)
+        pos_copy = {str(k): dict(v) for k, v in positions.items() if isinstance(v, dict)}
+        sync_slots_with_positions(norm_slots, pos_copy)
+        _runtime_positions.clear()
+        _runtime_positions.update(pos_copy)
+        _runtime_slots.clear()
+        _runtime_slots.update(norm_slots)
+        _bump_positions_revision()
+    _maybe_persist_positions_to_disk(pos_copy, norm_slots)
+    _maybe_persist_local_positions_file(pos_copy, norm_slots)
+
+
+def _maybe_persist_local_positions_file(
+    positions: dict[str, dict[str, Any]],
+    slots: dict[str, dict[str, Any]],
+) -> None:
+    """로컬 positions_state.json — slot_id 키, empty/filled + position."""
+    try:
+        from slot_registry import serialize_slot_portfolio_file
+
+        _save_json(
+            POSITIONS_STATE_FILE,
+            serialize_slot_portfolio_file(positions, slots),
+        )
+    except OSError:
+        pass
 
 
 def load_persisted_positions(*, force_reload: bool = False) -> dict[str, dict[str, Any]]:
@@ -275,16 +451,23 @@ def load_persisted_positions(*, force_reload: bool = False) -> dict[str, dict[st
         return {k: dict(v) for k, v in _runtime_positions.items()}
 
 
+def reload_positions_state_from_disk(*, bump_revision: bool = True) -> int:
+    """positions_state.json 디스크 → 메모리 강제 재로드 (매도 체결 직후 UI 동기화)."""
+    with _lock:
+        global _positions_bootstrapped
+        _positions_bootstrapped = False
+        _bootstrap_runtime_positions_once()
+        count = len(_runtime_positions)
+        if bump_revision:
+            _bump_positions_revision()
+        return count
+
+
 def save_persisted_positions(positions: dict[str, dict[str, Any]]) -> None:
     with _lock:
         _bootstrap_runtime_positions_once()
-        _runtime_positions.clear()
-        for code, pos in positions.items():
-            if isinstance(pos, dict):
-                _runtime_positions[str(code)] = dict(pos)
-        _bump_positions_revision()
-        snapshot = {k: dict(v) for k, v in _runtime_positions.items()}
-    _maybe_persist_positions_to_disk(snapshot)
+        slots = {k: dict(v) for k, v in _runtime_slots.items()}
+    save_portfolio_state(positions, slots)
 
 
 def sync_positions_from_broker_holdings(
@@ -300,6 +483,7 @@ def sync_positions_from_broker_holdings(
     with _lock:
         _bootstrap_runtime_positions_once()
         existing = {k: dict(v) for k, v in _runtime_positions.items()}
+        slots = {k: dict(v) for k, v in _runtime_slots.items()}
         synced: dict[str, dict[str, Any]] = {}
         now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -339,12 +523,35 @@ def sync_positions_from_broker_holdings(
                 pos["profit_pct"] = (current_price - entry_price) / entry_price * 100.0
             synced[code] = pos
 
+        removed = set(existing.keys()) - set(synced.keys())
+        from slot_registry import release_slot_by_code, sync_slots_with_positions
+
+        for code in removed:
+            prev = existing.get(code) or {}
+            from trading_categories import migrate_legacy_slot_uid
+
+            uid = str(prev.get("slot_uid") or "").strip()
+            if not uid:
+                uid = migrate_legacy_slot_uid(prev.get("slot_id") or prev.get("display_idx")) or ""
+            if uid:
+                from slot_registry import release_slot
+
+                release_slot(slots, uid)
+            else:
+                release_slot_by_code(slots, code)
+
         _runtime_positions.clear()
         _runtime_positions.update(synced)
+        from slot_registry import reconcile_holdings_to_slots
+
+        reconcile_holdings_to_slots(slots, synced)
+        _runtime_slots.clear()
+        _runtime_slots.update(slots)
         if bump_revision:
             _bump_positions_revision()
         snapshot = {k: dict(v) for k, v in synced.items()}
-    _maybe_persist_positions_to_disk(snapshot)
+    _maybe_persist_positions_to_disk(snapshot, slots)
+    _maybe_persist_local_positions_file(snapshot, slots)
     return len(synced)
 
 
@@ -359,10 +566,33 @@ def record_completed_trade(
     exit_type: str,
     sell_time: str | None = None,
     code: str = "",
+    *,
+    sell_price: int = 0,
+    quantity: int = 0,
 ) -> dict[str, Any]:
     with _lock:
-        data = _ensure_daily_unlocked()
         sell_time = sell_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        trade_day = sell_time[:10] if len(sell_time) >= 10 else date.today().isoformat()
+        qty = int(quantity or 0)
+        px = int(sell_price or 0)
+        if qty <= 0:
+            qty = 1
+        if px <= 0 and pnl != 0:
+            px = max(1, abs(int(pnl)) // qty)
+
+        save_trade_record(
+            stock_name=name,
+            side="sell",
+            price=px,
+            quantity=qty,
+            trade_date=trade_day,
+            trade_time=sell_time,
+            stock_code=code,
+            pnl=int(pnl),
+            profit_pct=float(profit_pct),
+            exit_type=exit_type,
+        )
+
         receipt: dict[str, Any] = {
             "종목명": name,
             "종목코드": code,
@@ -371,14 +601,17 @@ def record_completed_trade(
             "수익금액": int(pnl),
             "청산구분": exit_type,
         }
-        data.setdefault("completed_trades", []).append(receipt)
-        data["total_trade_count"] = int(data.get("total_trade_count", 0)) + 1
-        data["total_realized_profit"] = int(data.get("total_realized_profit", 0)) + int(pnl)
+
+        data = _ensure_daily_unlocked()
+        count, total, _ = _daily_totals_from_db(trade_day)
+        data["date"] = trade_day
+        data["total_trade_count"] = count
+        data["total_realized_profit"] = total
 
         week = _ensure_weekly_block(data)["weekly"]
-        week["realized_pnl"] = int(week.get("realized_pnl", 0)) + int(pnl)
-        week["trade_count"] = int(week.get("trade_count", 0)) + 1
-        week.setdefault("trades", []).append(dict(receipt))
+        week_agg = _weekly_totals_from_db(str(week.get("week_start") or _monday_of().isoformat()))
+        week["realized_pnl"] = int(week_agg.get("week_realized_pnl") or 0)
+        week["trade_count"] = int(week_agg.get("week_trade_count") or 0)
 
         _save_json(TRADE_STATE_FILE, data)
         return receipt
@@ -386,17 +619,15 @@ def record_completed_trade(
 
 def get_totals() -> tuple[int, int, str]:
     with _lock:
-        data = _ensure_daily_unlocked()
-        return (
-            int(data.get("total_trade_count", 0)),
-            int(data.get("total_realized_profit", 0)),
-            str(data.get("date", date.today().isoformat())),
-        )
+        _init_trade_history()
+        return _daily_totals_from_db()
 
 
 def get_completed_trades() -> list[dict[str, Any]]:
     with _lock:
-        return [dict(r) for r in _ensure_daily_unlocked().get("completed_trades", [])]
+        _init_trade_history()
+        today = date.today().isoformat()
+        return _trade_db.list_sell_receipts_for_date(today)
 
 
 def _parse_profit_pct(value: str | float) -> float:
@@ -412,30 +643,23 @@ def _parse_profit_pct(value: str | float) -> float:
 def get_daily_signature() -> tuple[str, int, int]:
     """5초 fragment 캐시 무효화 — 당일 청산(실현) 반영."""
     with _lock:
-        data = _ensure_daily_unlocked()
-        return (
-            str(data.get("date", "")),
-            int(data.get("total_realized_profit", 0)),
-            int(data.get("total_trade_count", 0)),
-        )
+        count, total, stats_date = _daily_totals_from_db()
+        return (stats_date, total, count)
 
 
 def get_daily_realized_pnl(*, force_refresh: bool = False) -> dict[str, Any]:
-    """오늘 확정 실현손익 (trade_state.json — 새로고침·재부팅 후에도 유지)."""
+    """오늘 확정 실현손익 — trade_history.db (trade_state.json 없어도 동작)."""
     with _lock:
-        if force_refresh:
-            data = _normalize_daily_data(_load_json(TRADE_STATE_FILE))
-            if data.get("date") != date.today().isoformat():
-                data = _ensure_daily_unlocked()
-            else:
-                data.setdefault("weekly", _default_weekly())
-                data = _ensure_weekly_block(data)
+        _init_trade_history()
+        if force_refresh or not TRADE_STATE_FILE.is_file():
+            count, total, stats_date = _daily_totals_from_db()
         else:
-            data = _ensure_daily_unlocked()
+            _ensure_daily_unlocked()
+            count, total, stats_date = _daily_totals_from_db()
         return {
-            "stats_date": str(data.get("date", "")),
-            "today_realized_pnl": int(data.get("total_realized_profit", 0)),
-            "today_trade_count": int(data.get("total_trade_count", 0)),
+            "stats_date": stats_date,
+            "today_realized_pnl": total,
+            "today_trade_count": count,
         }
 
 
@@ -447,12 +671,11 @@ def force_refresh_daily_state() -> dict[str, Any]:
 def get_weekly_signature() -> tuple[str, int, int]:
     """5초 fragment 캐시 무효화용 — 청산 시 주간 실현 반영."""
     with _lock:
-        data = _ensure_daily_unlocked()
-        week = _weekly_block(data)
+        summary = get_week_realized_summary()
         return (
-            str(week.get("week_start", "")),
-            int(week.get("realized_pnl", 0)),
-            int(week.get("trade_count", 0)),
+            str(summary.get("week_start", "")),
+            int(summary.get("week_realized_pnl", 0)),
+            int(summary.get("week_trade_count", 0)),
         )
 
 
@@ -474,23 +697,17 @@ def _sync_weekly_from_today_receipts(data: dict[str, Any]) -> None:
 
 def get_week_realized_summary() -> dict[str, Any]:
     """
-    이번 주(월~금) 누적 실현손익만 — weekly 블록 JSON 영속.
-    당일 영수증만 있고 weekly가 비었을 때 1회 동기화.
+    이번 주(월~일) 누적 실현손익 — trade_history.db 집계.
     """
     with _lock:
-        data = _ensure_daily_unlocked()
-        week = _weekly_block(data)
-        before_realized = int(week.get("realized_pnl", 0))
-        _sync_weekly_from_today_receipts(data)
-        week = _weekly_block(data)
-        if int(week.get("realized_pnl", 0)) != before_realized:
-            _save_json(TRADE_STATE_FILE, data)
-        realized = int(week.get("realized_pnl", 0))
-        monday = str(week.get("week_start", _monday_of().isoformat()))
+        _init_trade_history()
+        monday = _monday_of().isoformat()
+        week_agg = _weekly_totals_from_db(monday)
+        realized = int(week_agg.get("week_realized_pnl") or 0)
         return {
             "week_start": monday,
             "week_realized_pnl": realized,
-            "week_trade_count": int(week.get("trade_count", 0)),
+            "week_trade_count": int(week_agg.get("week_trade_count") or 0),
         }
 
 

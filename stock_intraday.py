@@ -214,8 +214,8 @@ def select_scalping_stocks(
                 extra={"minute_bars": minutes, "bars_3m": bars_3m},
             )
             decision = brain.classify(ctx)
-            scalp_score = float(decision.scores.get("scalping", 0))
-            if decision.mode != TradingMode.SCALPING and scalp_score < 45.0:
+            scalp_score = float(decision.scores.get("day_trading", decision.scores.get("scalping", 0)))
+            if decision.mode != TradingMode.DAY_TRADING and scalp_score < 45.0:
                 continue
             tagged = enrich_stock_with_brain(
                 brain.tag_stock(enriched, decision),

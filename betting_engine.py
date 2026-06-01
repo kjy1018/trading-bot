@@ -89,7 +89,7 @@ def score_conviction(pick: dict[str, Any]) -> float:
     score += pressure * 10.0
 
     mode = str(pick.get("trading_mode") or "swing")
-    if mode == "scalping" and chg >= 5.0 and vol_pct >= 300:
+    if mode == "day_trading" and chg >= 5.0 and vol_pct >= 300:
         score += 15.0
     if pick.get("setup") == "1m/3m 수급·체결강도" and pressure >= 0.55:
         score += 10.0

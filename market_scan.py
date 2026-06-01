@@ -8,6 +8,7 @@ import logging
 from typing import Any
 
 from config import REALTIME_SCAN_BATCH_SIZE
+from trading_logic import is_polling_strategy_mode
 from market_ai import get_active_allocation
 from brain import rank_universe_for_scan
 from stock_intraday import select_scalping_stocks
@@ -49,12 +50,17 @@ def select_market_entries(
     swing_w = float(alloc.get("swing_weight", 0.45))
     meta["allocation"] = alloc
 
-    scalp_max = max(0, min(max_count, round(max_count * scalp_w)))
-    if scalp_max <= 0 and max_count > 0 and scalp_w >= swing_w:
-        scalp_max = 1
-    swing_max = max(0, max_count - scalp_max)
-    if swing_max <= 0 and max_count > scalp_max:
-        swing_max = max(1, max_count - scalp_max)
+    if is_polling_strategy_mode():
+        scalp_max = 0
+        swing_max = max_count
+        meta["polling_mode"] = True
+    else:
+        scalp_max = max(0, min(max_count, round(max_count * scalp_w)))
+        if scalp_max <= 0 and max_count > 0 and scalp_w >= swing_w:
+            scalp_max = 1
+        swing_max = max(0, max_count - scalp_max)
+        if swing_max <= 0 and max_count > scalp_max:
+            swing_max = max(1, max_count - scalp_max)
 
     scalp_picks: list[dict] = []
     if scalp_max > 0:

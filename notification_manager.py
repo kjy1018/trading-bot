@@ -11,6 +11,7 @@ from ai_briefing import build_ai_briefing_payload
 from discord_control import (
     _compute_cumulative_asset_return_pct,
     _format_signed_pct,
+    send_daily_close_report_embed,
     send_daily_summary_embed,
     send_fill_embed,
 )
@@ -70,6 +71,15 @@ class NotificationManager:
             briefing=briefing,
             news_links=news,  # type: ignore[arg-type]
         )
+
+    def send_daily_close_report(self, report: dict[str, Any]) -> None:
+        """장 마감 AI 복기·시장·내일 전략 — 텔레그램/카카오/디스코드."""
+        md = str(report.get("markdown") or "").strip()
+        if not md:
+            return
+        if self.enabled:
+            self.send_text(md[:3500])
+        send_daily_close_report_embed(report)
 
     def send_daily_summary(
         self,

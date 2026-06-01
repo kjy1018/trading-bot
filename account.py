@@ -378,3 +378,31 @@ def get_account_snapshot(
         "principal_return_pct": principal_return_pct,
         **pnl,
     }
+
+
+def get_daily_trade_settlement(
+    *,
+    trade_date: str | None = None,
+) -> dict[str, object]:
+    """
+    장마감·정산용 당일 매매 집계.
+    trade_state.json 없이 trade_history.db 만으로 조회 가능.
+    """
+    from datetime import date
+
+    import trade_history_db as thdb
+
+    thdb.init_trade_history_db()
+    day = trade_date or date.today().isoformat()
+    agg = thdb.aggregate_daily(day)
+    receipts = thdb.list_sell_receipts_for_date(day)
+    buys = thdb.list_trades_for_date(day, side="buy")
+    return {
+        "trade_date": day,
+        "trade_count": int(agg.get("trade_count") or 0),
+        "realized_pnl": int(agg.get("total_pnl") or 0),
+        "sell_count": int(agg.get("sell_count") or 0),
+        "buy_count": len(buys),
+        "completed_trades": receipts,
+        "all_trades": buys + thdb.list_trades_for_date(day, side="sell"),
+    }

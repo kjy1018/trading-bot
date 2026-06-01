@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timedelta
+
+import pandas as pd
 from html import escape
 from typing import Any
 
@@ -41,8 +43,10 @@ from trade_state import (
     ensure_trade_state_file,
     get_daily_signature,
     get_dashboard_refresh_nonce,
+    get_performance_chart_series,
     get_positions_revision,
     get_weekly_signature,
+    save_account_snapshot_for_charts,
 )
 from scheduler import (
     MAX_SLOTS,
@@ -61,16 +65,19 @@ from scheduler import (
     get_daily_trade_history,
     get_order_status_snapshot,
     get_positions_snapshot,
+    get_slot_layout_snapshot,
     build_status_banner_text,
     get_boot_scan_status,
     get_recent_watch_hms,
     get_scan_timing,
+    get_daily_close_report,
     get_scheduler_status,
     get_ui_universe_recommendations,
     get_watch_time_snapshot,
     manual_buy_recommended_pick,
     preview_manual_pick_entry,
     start_background_scheduler,
+    set_slot_personality,
     update_position_trading_mode,
 )
 
@@ -93,7 +100,7 @@ _MODE_LABELS = {
 }
 _SLOT_MODE_OPTIONS = ["단타", "스윙", "장투"]
 _SLOT_MODE_TO_VALUE = {
-    "단타": "scalping",
+    "단타": "day_trading",
     "스윙": "swing",
     "장투": "long_term",
 }
@@ -123,6 +130,10 @@ def _clear_positions_session_cache() -> None:
         "positions_display",
         "positions_last_ok_at",
         "positions_cache_stale",
+        "runtime_positions",
+        "runtime_slot_layout",
+        "runtime_state_revision",
+        "ui_scheduler_sig",
     ):
         st.session_state.pop(key, None)
 
@@ -143,10 +154,22 @@ def _mirror_runtime_state_to_session(*, force: bool = False) -> bool:
         return False
 
     positions = get_positions_snapshot()
+    layout = get_slot_layout_snapshot()
     st.session_state["runtime_state_revision"] = revision
     st.session_state["runtime_account"] = dict(account)
     st.session_state["runtime_account_updated_at"] = acct_ts
     st.session_state["runtime_positions"] = [dict(p) for p in positions if isinstance(p, dict)]
+    st.session_state["runtime_slot_layout"] = [dict(c) for c in layout if isinstance(c, dict)]
+    try:
+        if account_total := int(account.get("account_total_eval") or 0):
+            if account_total > 0:
+                save_account_snapshot_for_charts(
+                    account_total,
+                    stock_eval=int(account.get("stock_eval") or account.get("total_eval") or 0),
+                    cash=int(account.get("cash") or 0),
+                )
+    except Exception:
+        pass
     return True
 
 
@@ -309,6 +332,41 @@ def _store_stable_positions(
     st.session_state["positions_last_ok_at"] = time.time()
 
 
+def _positions_from_account_holdings_fallback() -> list[dict[str, Any]]:
+    """스케줄러 스냅샷 지연 시 — 계좌 잔고 holdings 로 UI 최소 표시."""
+    account = _session_account_snapshot()
+    holdings = account.get("holdings") or {}
+    if not isinstance(holdings, dict) or not holdings:
+        return []
+    token = st.session_state.get("access_token")
+    out: list[dict[str, Any]] = []
+    for raw_code, holding in holdings.items():
+        if not isinstance(holding, dict):
+            continue
+        code = normalize_code(raw_code or holding.get("code"))
+        if len(code) != 6:
+            continue
+        qty = int(holding.get("quantity") or 0)
+        if qty <= 0:
+            continue
+        entry = int(holding.get("avg_price") or 0)
+        current = int(holding.get("current_price") or entry or 0)
+        name = str(holding.get("name") or code).strip()
+        pos: dict[str, Any] = {
+            "code": code,
+            "name": name,
+            "quantity": qty,
+            "entry_price": entry,
+            "current_price": current,
+            "display_name": f"{name} ({code})" if name != code else code,
+            "is_uncategorized": True,
+        }
+        if current > 0 and entry > 0:
+            pos["profit_pct"] = (current - entry) / entry * 100.0
+        out.append(_enrich_slot_position(pos, token))
+    return out
+
+
 def _positions_for_display() -> list[dict[str, Any]]:
     _sync_ui_snapshots_from_scheduler(trigger_rerun=False)
     _mirror_runtime_state_to_session()
@@ -321,6 +379,11 @@ def _positions_for_display() -> list[dict[str, Any]]:
         _store_stable_positions(enriched, slot_count=slot_count)
         st.session_state["positions_cache_stale"] = False
         return enriched
+    fallback = _positions_from_account_holdings_fallback()
+    if fallback:
+        _store_stable_positions(fallback, slot_count=len(fallback))
+        st.session_state["positions_cache_stale"] = True
+        return fallback
     if slot_count <= 0:
         _store_stable_positions([], slot_count=0)
         st.session_state["positions_cache_stale"] = False
@@ -403,7 +466,7 @@ def _persist_slot_mode(idx: int, label: str, code: str | None = None) -> None:
 
 
 def _commit_trading_mode_change(idx: int, code: str) -> None:
-    """selectbox on_change — 슬롯·종목코드·보유 포지션 백엔드 동기화."""
+    """selectbox on_change — 슬롯 실시간 성격 → scheduler 메모리·전술 즉시 반영."""
     widget_key = _mode_widget_key_for_slot(idx)
     label = str(st.session_state.get(widget_key) or _DEFAULT_SLOT_MODE_LABEL)
     if label not in _SLOT_MODE_OPTIONS:
@@ -411,19 +474,10 @@ def _commit_trading_mode_change(idx: int, code: str) -> None:
         st.session_state[widget_key] = label
     norm_code = normalize_code(code)
     _persist_slot_mode(idx, label, norm_code or None)
-    if len(norm_code) != 6:
-        return
-    held_codes = {
-        normalize_code(p.get("code"))
-        for p in get_positions_snapshot()
-        if normalize_code(p.get("code"))
-    }
-    if norm_code not in held_codes:
-        return
-    result = update_position_trading_mode(norm_code, label)
+    result = set_slot_personality(idx, label)
     if result.get("success"):
         st.session_state["slot_action_notice"] = (
-            f"✅ 슬롯 {idx} {result.get('message', '')}"
+            f"✅ {result.get('message', f'슬롯 {idx} 모드 변경')}"
         )
         _clear_commander_metrics_cache()
     else:
@@ -447,14 +501,61 @@ def _prepare_mode_selectbox_state(
     return widget_key
 
 
-def _selected_slot_mode_label(idx: int, ticker: str | None = None) -> str:
-    code = normalize_code(ticker) if ticker else ""
-    return _resolve_mode_label_for_slot(idx, code=code or None)
+def _session_slot_layout() -> list[dict[str, Any]]:
+    rows = st.session_state.get("runtime_slot_layout")
+    if isinstance(rows, list) and rows:
+        return [dict(c) for c in rows if isinstance(c, dict)]
+    return get_slot_layout_snapshot()
+
+
+def _slot_spec_for_display_idx(idx: int) -> dict[str, Any] | None:
+    import trade_state
+    from slot_registry import slot_spec_for_display_idx
+
+    return slot_spec_for_display_idx(int(idx), trade_state.get_slots_book())
+
+
+def _slot_type_label(slot_type: str) -> str:
+    from trading_categories import CATEGORY_LABEL_KO, normalize_trading_category
+
+    return CATEGORY_LABEL_KO.get(
+        normalize_trading_category(slot_type), str(slot_type or "swing")
+    )
+
+
+def _required_mode_label_for_slot(idx: int) -> str:
+    spec = _slot_spec_for_display_idx(idx)
+    if not spec:
+        return _DEFAULT_SLOT_MODE_LABEL
+    from slot_registry import normalize_slot_type
+
+    stype = normalize_slot_type(spec.get("slot_type"))
+    return _SLOT_MODE_FROM_VALUE.get(stype, _DEFAULT_SLOT_MODE_LABEL)
+
+
+def _required_mode_value_for_slot(idx: int) -> str:
+    spec = _slot_spec_for_display_idx(idx)
+    if not spec:
+        return _SLOT_MODE_TO_VALUE.get(_DEFAULT_SLOT_MODE_LABEL, "long_term")
+    from slot_registry import normalize_slot_type
+
+    return normalize_slot_type(spec.get("slot_type"))
+
+
+def _slot_header_caption(idx: int) -> str:
+    stype = _slot_type_label(_required_mode_value_for_slot(idx))
+    return f"슬롯 {idx} · {stype}"
 
 
 def _selected_slot_mode_value(idx: int, ticker: str | None = None) -> str:
-    code = normalize_code(ticker) if ticker else ""
-    return selected_modes.resolve_mode_value_for_slot(idx, code=code or None)
+    import trade_state
+    from slot_registry import get_slot_personality_for_display_idx
+
+    return get_slot_personality_for_display_idx(idx, trade_state.get_slots_book())
+
+
+def _selected_slot_mode_label(idx: int, ticker: str | None = None) -> str:
+    return _SLOT_MODE_FROM_VALUE.get(_selected_slot_mode_value(idx), _DEFAULT_SLOT_MODE_LABEL)
 
 
 def _render_slot_mode_selector(
@@ -467,7 +568,7 @@ def _render_slot_mode_selector(
     widget_key = _prepare_mode_selectbox_state(
         idx, code=code or None, current_mode_value=current_mode
     )
-    st.caption("매매 모드")
+    st.caption(f"**현재 상태** · {_slot_header_caption(idx)}")
     selected = st.selectbox(
         f"슬롯 {idx} 매매 모드",
         options=_SLOT_MODE_OPTIONS,
@@ -478,6 +579,7 @@ def _render_slot_mode_selector(
     )
     label = str(selected)
     _persist_slot_mode(idx, label, code or None)
+    st.caption("장중 실시간 변경 · 재시작 없이 봇 전략 즉시 반영")
     return label
 
 
@@ -559,18 +661,29 @@ def _assign_next_slot_recommendation(
     return None
 
 
-def _sync_slot_controls(positions: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+def _sync_slot_controls(
+    positions: list[dict[str, Any]],
+    slot_layout: list[dict[str, Any]] | None = None,
+) -> dict[int, dict[str, Any]]:
     controls = _slot_controls_state()
-    held_count = min(len(positions), MAX_SLOTS_DISPLAY)
+    layout = slot_layout if slot_layout is not None else _session_slot_layout()
     held_codes = {
-        normalize_code(p.get("code")) for p in positions[:MAX_SLOTS_DISPLAY]
+        normalize_code(p.get("code"))
+        for p in positions
+        if len(normalize_code(p.get("code"))) == 6
     }
 
-    for idx in list(controls):
-        if idx <= held_count or idx > MAX_SLOTS_DISPLAY:
+    empty_idxs: list[int] = []
+    for cell in layout:
+        idx = int(cell.get("display_idx") or 0)
+        if idx <= 0 or idx > MAX_SLOTS_DISPLAY:
+            continue
+        if cell.get("is_empty"):
+            empty_idxs.append(idx)
+        else:
             controls.pop(idx, None)
 
-    for idx in range(held_count + 1, MAX_SLOTS_DISPLAY + 1):
+    for idx in empty_idxs:
         current = controls.get(idx) if isinstance(controls.get(idx), dict) else {}
         code = normalize_code(current.get("code"))
         duplicated = any(
@@ -850,7 +963,8 @@ st.markdown(
         font-size: 0.78rem; font-weight: 700; color: #fff; margin-right: 0.35rem;
         vertical-align: middle; letter-spacing: 0.02em;
     }
-    .mode-badge.mode-scalping {
+    .mode-badge.mode-scalping,
+    .mode-badge.mode-day-trading {
         background: linear-gradient(135deg, #e65100, #ff9800);
         box-shadow: 0 1px 4px rgba(230,81,0,0.35);
     }
@@ -1021,6 +1135,9 @@ def _format_signed_pct(pct: float) -> str:
 
 
 def _count_held_slots(positions: list[dict[str, Any]]) -> int:
+    layout = _session_slot_layout()
+    if layout:
+        return sum(1 for cell in layout if not cell.get("is_empty"))
     n = 0
     for p in positions[:MAX_SLOTS_DISPLAY]:
         if len(normalize_code(p.get("code"))) == 6:
@@ -1222,6 +1339,8 @@ def _render_empty_control_slot(
     idx: int,
     candidate: dict[str, Any] | None,
     positions: list[dict[str, Any]],
+    *,
+    slot_id: str = "",
 ) -> None:
     candidate = _safe_slot_candidate(candidate)
     cand_code = normalize_code(candidate.get("code")) if candidate else ""
@@ -1266,9 +1385,10 @@ def _render_empty_control_slot(
         else:
             st.caption("예상 투입금/수량은 장중 시세 수신 후 표시됩니다.")
     else:
+        header = _slot_header_caption(idx)
         st.markdown(
-            f'<div style="font-size:1.6rem;">🧭</div><strong>슬롯 {idx}</strong><br>'
-            f"<span style='font-size:0.9rem;'>[대기 중] 버튼을 눌러 종목을 추천받으세요</span>",
+            f'<div style="font-size:1.6rem;">🧭</div><strong>{header}</strong><br>'
+            f"<span style='font-size:0.9rem;'>Empty · [🔄 다른 종목 추천]으로 후보를 불러오세요</span>",
             unsafe_allow_html=True,
         )
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1355,7 +1475,7 @@ def _render_slot(pos: dict[str, Any] | None, idx: int, positions: list[dict[str,
         bet_line = pos.get("bet_label") or pos.get("bet_tier") or ""
         cap_txt = f" · 투입 {deployed:,}원" if deployed > 0 else ""
         st.caption(
-            f"슬롯 {idx} · {pos.get('quantity', 0)}주{cap_txt}"
+            f"{_slot_header_caption(idx)} · {pos.get('quantity', 0)}주{cap_txt}"
             f"{(' · ' + str(bet_line)) if bet_line else ''} · "
             f"{pos.get('updated_at', '-')}{_slot_progress_hint(pos)}{trail}{sl_txt}"
         )
@@ -1367,28 +1487,141 @@ def _render_slot(pos: dict[str, Any] | None, idx: int, positions: list[dict[str,
             use_container_width=True,
         )
     else:
-        controls = _sync_slot_controls(positions)
+        controls = _sync_slot_controls(positions, _session_slot_layout())
         _render_empty_control_slot(idx, controls.get(idx), positions)
 
 
+def _uncategorized_layout_cells(
+    layout: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    rows = layout if layout is not None else _session_slot_layout()
+    return [c for c in rows if c.get("is_uncategorized") and not c.get("is_empty")]
+
+
+def _render_uncategorized_holding(pos: dict[str, Any]) -> None:
+    title = _slot_title_label(pos)
+    st.markdown('<div class="slot-card-filled">', unsafe_allow_html=True)
+    st.markdown(f"**{title}**")
+    st.caption("슬롯 미배치 — 계좌 잔고에서 직접 확인된 보유 종목")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("수량", f"{int(pos.get('quantity') or 0):,}주")
+    with c2:
+        st.metric("평단가", f"{int(pos.get('entry_price') or 0):,}원")
+    with c3:
+        st.metric("현재가", f"{int(pos.get('current_price') or 0):,}원")
+    _render_profit_banner(float(pos.get("profit_pct", 0)))
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def _render_uncategorized_section(
+    positions: list[dict[str, Any]],
+    layout: list[dict[str, Any]] | None = None,
+) -> None:
+    rows = layout if layout is not None else _session_slot_layout()
+    cells = _uncategorized_layout_cells(rows)
+    shown: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for cell in cells:
+        pos = cell.get("position") if isinstance(cell.get("position"), dict) else None
+        if not pos:
+            continue
+        code = normalize_code(pos.get("code"))
+        if len(code) != 6 or code in seen:
+            continue
+        seen.add(code)
+        shown.append(pos)
+
+    if not shown:
+        for pos in positions:
+            if not pos.get("is_uncategorized"):
+                continue
+            code = normalize_code(pos.get("code"))
+            if len(code) != 6 or code in seen:
+                continue
+            seen.add(code)
+            shown.append(pos)
+
+    if not shown:
+        account = _session_account_snapshot()
+        holdings = account.get("holdings") or {}
+        assigned = {
+            normalize_code(c.get("code"))
+            for c in rows
+            if not c.get("is_empty") and not c.get("is_uncategorized")
+        }
+        if isinstance(holdings, dict):
+            token = st.session_state.get("access_token")
+            for raw_code, holding in holdings.items():
+                if not isinstance(holding, dict):
+                    continue
+                code = normalize_code(raw_code or holding.get("code"))
+                if len(code) != 6 or code in seen or code in assigned:
+                    continue
+                qty = int(holding.get("quantity") or 0)
+                if qty <= 0:
+                    continue
+                entry = int(holding.get("avg_price") or 0)
+                current = int(holding.get("current_price") or entry or 0)
+                name = str(holding.get("name") or code).strip()
+                pos = {
+                    "code": code,
+                    "name": name,
+                    "quantity": qty,
+                    "entry_price": entry,
+                    "current_price": current,
+                    "is_uncategorized": True,
+                }
+                if current > 0 and entry > 0:
+                    pos["profit_pct"] = (current - entry) / entry * 100.0
+                seen.add(code)
+                shown.append(_enrich_slot_position(pos, token))
+
+    if not shown:
+        return
+
+    st.markdown("### 기타 (Uncategorized)")
+    st.caption(
+        "5개 슬롯에 배치되지 않은 보유 종목입니다. "
+        "슬롯을 비우거나 성격을 맞춘 뒤 잔고 동기화 시 자동 배치됩니다."
+    )
+    cols = st.columns(min(len(shown), 3))
+    for i, pos in enumerate(shown):
+        with cols[i % len(cols)]:
+            _render_uncategorized_holding(pos)
+
+
 def _render_slots_grid(positions: list[dict[str, Any]], max_slots: int) -> None:
-    controls = _sync_slot_controls(positions)
+    layout = _session_slot_layout()
+    slot_layout = [c for c in layout if not c.get("is_uncategorized")]
+    controls = _sync_slot_controls(positions, slot_layout)
     idx = 0
     for row_cols in _slot_rows_layout(max_slots):
         cols = st.columns(row_cols)
         for col in cols:
             idx += 1
             if idx > max_slots:
+                _render_uncategorized_section(positions, layout)
                 return
-            pos = positions[idx - 1] if idx - 1 < len(positions) else None
+            cell = next(
+                (c for c in slot_layout if int(c.get("display_idx") or 0) == idx),
+                None,
+            )
+            pos = None
+            if cell and not cell.get("is_empty"):
+                pos = cell.get("position") if isinstance(cell.get("position"), dict) else None
             with col:
                 if pos is not None:
                     _render_slot(pos, idx, positions)
                 else:
-                    _render_empty_control_slot(idx, controls.get(idx), positions)
+                    sid = str(cell.get("slot_id") or "") if cell else ""
+                    _render_empty_control_slot(
+                        idx, controls.get(idx), positions, slot_id=sid
+                    )
+    _render_uncategorized_section(positions, layout)
 
 
-@st.fragment(run_every=timedelta(seconds=3))
+@st.fragment(run_every=timedelta(seconds=1))
 def _ui_snapshot_watchdog() -> None:
     """체결·잔고 변경 nonce → st.session_state 미러 → st.rerun()."""
     prev_nonce = st.session_state.get("ui_dashboard_refresh_nonce")
@@ -1469,12 +1702,19 @@ def _ws_live_status_panel() -> None:
     label = str(health.get("status_label") or status.get("ws_status") or "WS 상태 확인 중")
     err = health.get("last_error") or status.get("ws_last_error")
     gap = health.get("seconds_since_rx")
-    timeout = float(health.get("heartbeat_timeout_sec") or getattr(config, "WS_HEARTBEAT_TIMEOUT_SEC", 5))
+    timeout = float(health.get("heartbeat_timeout_sec") or getattr(config, "WS_HEARTBEAT_TIMEOUT_SEC", 20))
 
     banner = st.empty()
     with banner.container():
-        if not getattr(config, "USE_REALTIME_WEBSOCKET", True):
-            st.info("실시간 WS 비활성 — REST 폴백 감시 모드")
+        if getattr(config, "POLLING_STRATEGY_MODE", False) or not getattr(
+            config, "USE_REALTIME_WEBSOCKET", True
+        ):
+            poll_sec = float(getattr(config, "POLLING_POSITION_INTERVAL_SEC", 8))
+            bal_sec = float(getattr(config, "POLLING_BALANCE_INTERVAL_SEC", 30))
+            st.info(
+                f"스윙/장투 폴링 모드 — 보유 종목 {poll_sec:.0f}초 · "
+                f"잔고 동기화 {bal_sec:.0f}초 · MA 확인 후 진입"
+            )
             return
 
         gap_text = f" · 마지막 수신 {float(gap):.0f}초 전" if gap is not None else ""
@@ -1486,10 +1726,12 @@ def _ws_live_status_panel() -> None:
                     f"체결 틱 즉시 판정 활성"
                 )
         elif reconnecting or not connected:
-            with st.status("🔴 WS 연결 끊김 (재연결 중...)", state="error"):
+            with st.status("🟡 WS 재연결 중...", state="running"):
                 st.write(label + gap_text)
-                if err:
-                    st.caption(str(err))
+                st.caption(
+                    f"자동 재연결 진행 중 (1→3→5초 백오프 · 무한 재시도) · "
+                    f"한도 {timeout:.0f}초"
+                )
         else:
             with st.status("🟡 WS 연결됨 · 데이터 수신 없음", state="running"):
                 st.write(label + gap_text)
@@ -1500,7 +1742,19 @@ def _ws_live_status_panel() -> None:
                     st.caption(str(err))
 
 
-@st.fragment(run_every=timedelta(seconds=5))
+def _render_daily_close_report_banner() -> None:
+    """장 마감 직후 AI 복기·시장·내일 전략 — 대시보드 상단."""
+    report = get_daily_close_report()
+    if not report or not report.get("markdown"):
+        return
+    day = str(report.get("trade_date") or "")
+    gen = str(report.get("generated_at") or "")
+    with st.expander(f"📋 장 마감 AI 리포트 ({day})", expanded=True):
+        st.caption(f"생성 {gen} · trade_history.db · 코스피/코스닥/나스닥 · 보유 MA")
+        st.markdown(str(report.get("markdown") or ""))
+
+
+@st.fragment(run_every=timedelta(seconds=1))
 def _header_panel() -> None:
     status = get_scheduler_status()
     timing = get_scan_timing()
@@ -1509,6 +1763,7 @@ def _header_panel() -> None:
     stats = get_daily_stats(force_refresh=True)
 
     st.title("주도주·우량주 제어 대시보드")
+    _render_daily_close_report_banner()
     boot_toast = st.session_state.pop("boot_scan_toast", None)
     if boot_toast:
         if boot_toast.startswith("✅"):
@@ -1586,9 +1841,14 @@ def _header_panel() -> None:
 @st.fragment(run_every=timedelta(seconds=COMMANDER_PNL_REFRESH_SEC))
 def _slots_panel() -> None:
     positions = _positions_for_display()
-    st.markdown(
-        f"### 장투/주도주 우량주 제어 슬롯 ({len(positions)}/{MAX_SLOTS_DISPLAY})"
-    )
+    layout = _session_slot_layout()
+    slot_layout = [c for c in layout if not c.get("is_uncategorized")]
+    filled = sum(1 for c in slot_layout if not c.get("is_empty")) if slot_layout else 0
+    uncat = len(_uncategorized_layout_cells(layout))
+    header = f"### 장투/주도주 우량주 제어 슬롯 ({filled}/{MAX_SLOTS_DISPLAY})"
+    if uncat:
+        header += f" · 기타 {uncat}종목"
+    st.markdown(header)
     slot_notice = st.session_state.pop("slot_action_notice", None)
     if slot_notice:
         if str(slot_notice).startswith("✅"):
@@ -1597,11 +1857,16 @@ def _slots_panel() -> None:
             st.warning(str(slot_notice))
     if st.session_state.get("positions_cache_stale"):
         st.info("데이터 수신 대기 중입니다. 슬롯 레이아웃은 마지막 정상 상태를 유지합니다.")
-    _render_slots_grid(positions[:MAX_SLOTS_DISPLAY], MAX_SLOTS_DISPLAY)
+    _render_slots_grid(positions, MAX_SLOTS_DISPLAY)
     if positions:
         st.caption(
             f"보유 슬롯은 실시간 감시 상태를 유지하고, 빈 슬롯은 [🔄 다른 종목 추천] 버튼으로 "
             f"100억 유니버스 대장주를 수동 교체합니다. 총시드 {_total_seed():,}원"
+        )
+    elif _positions_from_account_holdings_fallback():
+        st.warning(
+            "계좌에 보유 종목이 있으나 슬롯 배치 중입니다. "
+            "잠시 후 자동 반영되거나 기타(Uncategorized) 영역에 표시됩니다."
         )
     else:
         st.info(
@@ -1675,6 +1940,71 @@ def _receipts_panel() -> None:
     st.markdown(f"**오늘 합산 실현손익: {total:+,}원**")
 
 
+@st.fragment(run_every=timedelta(seconds=3))
+def _performance_charts_panel() -> None:
+    """하단 고정 — 누적 자산 곡선 · 일별 실현손익 (trade_history.db)."""
+    _mirror_runtime_state_to_session()
+    _, _, account_total, stale, updated_at = _read_account_panel_values()
+    principal = int(
+        getattr(config, "ACCOUNT_INITIAL_PRINCIPAL", 0)
+        or getattr(config, "ACCOUNT_TOTAL_SEED", 0)
+        or 0
+    )
+    try:
+        chart_data = get_performance_chart_series(
+            initial_principal=principal,
+            live_account_total=account_total if account_total > 0 else None,
+        )
+    except Exception:
+        chart_data = {"equity": [], "daily_pnl": []}
+
+    st.divider()
+    st.markdown("### 📈 매매 성과 차트")
+    cap = f" · 잔고 갱신 {updated_at}" if updated_at else ""
+    if stale:
+        st.caption(f"계좌 스냅샷 대기 중 — DB·체결 기록 기준으로 표시합니다.{cap}")
+    else:
+        st.caption(
+            f"누적 자산: 계좌 스냅샷 + 실현손익 · 일별 막대: 매도 체결 실현손익 · "
+            f"3초 주기 갱신{cap}"
+        )
+
+    col_eq, col_bar = st.columns(2)
+    equity_rows = chart_data.get("equity") or []
+    pnl_rows = chart_data.get("daily_pnl") or []
+
+    with col_eq:
+        st.markdown("**누적 수익 곡선** (날짜별 전체 자산)")
+        if equity_rows:
+            df_eq = pd.DataFrame(equity_rows)
+            if "날짜" in df_eq.columns:
+                df_eq = df_eq.set_index("날짜")
+            st.line_chart(df_eq, height=300, use_container_width=True)
+            last = equity_rows[-1].get("전체 자산 (원)", 0)
+            st.metric("최신 전체 자산", f"{int(last):,}원")
+        elif account_total > 0:
+            today = datetime.now().strftime("%Y-%m-%d")
+            df_eq = pd.DataFrame(
+                [{"날짜": today, "전체 자산 (원)": account_total}]
+            ).set_index("날짜")
+            st.line_chart(df_eq, height=300, use_container_width=True)
+            st.caption("매매·스냅샷 이력이 쌓이면 날짜별 곡선이 확장됩니다.")
+        else:
+            st.info("계좌 잔고가 연결되면 전체 자산 곡선이 표시됩니다.")
+
+    with col_bar:
+        st.markdown("**실현 손익 막대** (날짜별 당일 손익)")
+        if pnl_rows:
+            df_bar = pd.DataFrame(pnl_rows)
+            if "날짜" in df_bar.columns:
+                df_bar = df_bar.set_index("날짜")
+            st.bar_chart(df_bar, height=300, use_container_width=True)
+            today_pnl = int(pnl_rows[-1].get("실현 손익 (원)", 0))
+            st.metric("최근 거래일 실현손익", f"{today_pnl:+,}원")
+        else:
+            st.info("매도 체결이 기록되면 일별 실현손익 막대가 표시됩니다.")
+
+
 _warm_ui_session_caches()
 _mirror_runtime_state_to_session(force=True)
 _sync_boot_scan_to_session()
@@ -1691,4 +2021,5 @@ _render_section_safely("지휘관 실시간 수익률", _commander_pnl_live_pane
 _render_section_safely("상단 현황판", _header_panel, divider_after=True)
 _render_section_safely("슬롯 제어판", _slots_panel, divider_after=True)
 _render_section_safely("계좌 현황", _account_panel, token, divider_after=True)
-_render_section_safely("청산 영수증", _receipts_panel)
+_render_section_safely("청산 영수증", _receipts_panel, divider_after=True)
+_render_section_safely("매매 성과 차트", _performance_charts_panel)

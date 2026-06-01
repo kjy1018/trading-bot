@@ -61,10 +61,13 @@ from trading_logic import (
     apply_tactical_fields_on_position,
     decide_position_exit,
     get_entry_stop_loss,
+    is_polling_strategy_mode,
     monitor_interval_for_positions,
+    passes_polling_entry_ma_filter,
     plan_position_add,
     position_trading_mode,
     refresh_target_live_fields,
+    requires_daily_bars,
     requires_fast_tick_exit,
     requires_hourly_bars,
     requires_minute_bars,
@@ -163,6 +166,8 @@ _state: dict[str, Any] = {
     "order_events": [],
     "ui_slot_recommendations": [],
     "buy_paused": False,
+    "daily_close_report": None,
+    "daily_close_report_date": None,
 }
 
 _positions: dict[str, dict[str, Any]] = {}
@@ -170,6 +175,8 @@ _engine_thread: threading.Thread | None = None
 _monitor_thread: threading.Thread | None = None
 _last_scan_at: float = 0.0
 _last_monitor_at: float = 0.0
+_last_balance_poll_at: float = 0.0
+_daily_bars_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _universe_cache: list[dict[str, Any]] = []
 _universe_cache_at: float = 0.0
 _scan_batch_cursor: int = 0
@@ -206,20 +213,42 @@ _force_scan_result_epoch: float = 0.0
 _buy_paused = False
 
 ORDER_STATUS_POLL_SEC = float(getattr(config, "ORDER_STATUS_POLL_SEC", 10))
+ORDER_FILL_POLL_ACTIVE_SEC = float(
+    getattr(config, "ORDER_FILL_POLL_ACTIVE_SEC", 1)
+)
 ACCOUNT_SNAPSHOT_REFRESH_SEC = float(getattr(config, "ACCOUNT_SNAPSHOT_REFRESH_SEC", 45))
 ORDER_EVENT_HISTORY_MAX = int(getattr(config, "ORDER_EVENT_HISTORY_MAX", 40))
 
 _order_queue: queue.Queue[dict[str, Any]] = queue.Queue()
 _order_worker_thread: threading.Thread | None = None
 _order_fill_thread: threading.Thread | None = None
+_order_fill_wake = threading.Event()
 _orders_lock = threading.Lock()
 _orders: dict[str, dict[str, Any]] = {}
 _order_events: deque[dict[str, Any]] = deque(maxlen=ORDER_EVENT_HISTORY_MAX)
 _last_account_refresh_at: float = 0.0
+_last_ws_resync_at: float = 0.0
+WS_RECONNECT_RESYNC_DEBOUNCE_SEC = float(
+    getattr(config, "WS_RECONNECT_RESYNC_DEBOUNCE_SEC", 3.0)
+)
 _notifier = NotificationManager()
 _last_open_summary_sent_date: str | None = None
 _last_close_summary_sent_date: str | None = None
+_last_close_report_sent_date: str | None = None
 _last_preopen_boot_date: str | None = None
+
+
+def _wake_order_fill_poller() -> None:
+    """매도·매수 주문 접수 직후 체결 폴러 즉시 깨우기."""
+    _order_fill_wake.set()
+
+
+def _has_pending_orders() -> bool:
+    with _orders_lock:
+        return any(
+            _is_open_order_status(str(v.get("status")))
+            for v in _orders.values()
+        )
 
 
 def _parse_hhmm(value: str) -> dt_time:
@@ -302,24 +331,9 @@ _MODE_BY_LABEL = {str(label): mode for mode, label in MODE_LABEL_KO.items()}
 
 
 def _normalize_trading_mode(raw: Any, fallback: str = "swing") -> str:
-    text = str(raw or "").strip()
-    if text in _MODE_BY_LABEL:
-        return _MODE_BY_LABEL[text].value
-    lowered = text.lower()
-    if lowered in _MODE_BY_VALUE:
-        return lowered
-    aliases = {
-        "scalp": TradingMode.SCALPING.value,
-        "scalping": TradingMode.SCALPING.value,
-        "short": TradingMode.SCALPING.value,
-        "swing": TradingMode.SWING.value,
-        "long": TradingMode.LONG_TERM.value,
-        "longterm": TradingMode.LONG_TERM.value,
-        "long_term": TradingMode.LONG_TERM.value,
-    }
-    if lowered in aliases:
-        return aliases[lowered]
-    return fallback if fallback in _MODE_BY_VALUE else TradingMode.SWING.value
+    from trading_categories import normalize_trading_category
+
+    return normalize_trading_category(raw, fallback=fallback)
 
 
 def _mode_tags_for_value(mode_value: str) -> dict[str, Any]:
@@ -364,17 +378,26 @@ def _lock_ui_trading_mode(pick: dict[str, Any]) -> dict[str, Any]:
     mode_raw = out.get("selected_trading_mode") or out.get("trading_mode")
     if slot_idx is not None and int(slot_idx) > 0:
         try:
-            from selected_modes import resolve_mode_value_for_slot
+            from slot_registry import get_slot_personality_for_display_idx
 
-            mode_raw = resolve_mode_value_for_slot(
-                int(slot_idx),
-                code=code or None,
-                fallback_value=mode_raw,
-            )
+            mode_raw = get_slot_personality_for_display_idx(int(slot_idx))
             out["ui_slot_index"] = int(slot_idx)
             out["ui_mode_locked"] = True
         except ImportError:
             pass
+        if not mode_raw:
+            try:
+                from selected_modes import resolve_mode_value_for_slot
+
+                mode_raw = resolve_mode_value_for_slot(
+                    int(slot_idx),
+                    code=code or None,
+                    fallback_value=mode_raw,
+                )
+                out["ui_slot_index"] = int(slot_idx)
+                out["ui_mode_locked"] = True
+            except ImportError:
+                pass
     elif out.get("ui_mode_locked") and mode_raw:
         out["ui_mode_locked"] = True
     if mode_raw:
@@ -507,6 +530,8 @@ def _create_order_state(intent: dict[str, Any]) -> dict[str, Any]:
         "budget_won": int(intent.get("budget_won") or 0),
         "reason": intent.get("reason"),
         "baseline_qty": int(intent.get("baseline_qty") or 0),
+        "slot_uid": str(intent.get("slot_uid") or intent.get("slot_id") or ""),
+        "slot_id": str(intent.get("slot_id") or ""),
         "payload": dict(intent),
         "broker_order_no": "",
     }
@@ -585,6 +610,16 @@ def _refresh_account_snapshot(
         with _state_lock:
             _state["account_snapshot"] = snap
         _last_account_refresh_at = now
+        try:
+            total = int(snap.get("account_total_eval") or 0)
+            if total > 0:
+                trade_state.save_account_snapshot_for_charts(
+                    total,
+                    stock_eval=int(snap.get("stock_eval") or snap.get("total_eval") or 0),
+                    cash=int(snap.get("cash") or 0),
+                )
+        except Exception as exc:
+            logger.debug("계좌 스냅샷 DB 저장 스킵: %s", exc)
         if sync_runtime_positions:
             _apply_runtime_positions_from_store()
     return snap
@@ -634,6 +669,58 @@ def _should_run_realtime_scan() -> bool:
     if _last_scan_at <= 0:
         return True
     return time.time() - _last_scan_at >= _scan_debounce_sec()
+
+
+def _sync_balance_after_ws_reconnect() -> None:
+    """
+    WS 자동 재연결 직후 — 끊김 동안 놓친 체결·잔고를 inquire_balance로 보정.
+    """
+    global _last_ws_resync_at
+    now = _now_ts()
+    if now - _last_ws_resync_at < WS_RECONNECT_RESYNC_DEBOUNCE_SEC:
+        logger.debug("WS 재연결 동기화 디바운스 — 스킵")
+        return
+    _last_ws_resync_at = now
+    logger.info("WS 재연결 — inquire_balance 잔고·포지션 강제 동기화")
+    with _state_lock:
+        _state["ws_status"] = "WS 재연결됨 · 잔고 동기화 중"
+    try:
+        snap = _refresh_account_snapshot(
+            force=True,
+            sync_runtime_positions=True,
+            bump_positions_revision=True,
+        )
+        _apply_runtime_positions_from_store()
+        _sync_positions_state()
+        try:
+            trade_state.reload_positions_state_from_disk()
+        except Exception as exc:
+            logger.debug("WS 재연결 positions_state 재로드: %s", exc)
+        _sync_ws_watchlist()
+        _force_refresh_trade_state_sync("ws_reconnect")
+        trade_state.request_dashboard_refresh("ws_reconnect")
+        holdings = snap.get("holdings") or {}
+        n_hold = len(holdings) if isinstance(holdings, dict) else 0
+        n_slots = len(get_positions_snapshot())
+        logger.info(
+            "WS 재연결 동기화 완료 · broker %d종목 · UI 슬롯 %d",
+            n_hold,
+            n_slots,
+        )
+        with _state_lock:
+            _state["ws_status"] = "WS 정상 (재연결·동기화 완료)"
+            _state["ws_last_error"] = None
+        try:
+            from trading_logic import finalize_order_fill_dashboard_sync
+
+            finalize_order_fill_dashboard_sync(side="ws_reconnect", code="")
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.warning("WS 재연결 잔고 동기화 실패: %s", exc)
+        with _state_lock:
+            _state["ws_status"] = "WS 재연결됨 · 잔고 동기화 실패"
+            _state["ws_last_error"] = str(exc)
 
 
 def _sync_ws_watchlist() -> None:
@@ -799,6 +886,28 @@ def _refresh_balance_after_fill(side: str, code: str) -> None:
         logger.debug("체결 직후 dashboard sync 실패: %s", exc)
 
 
+def _sync_after_sell_fill_confirmed(code: str) -> None:
+    """
+    매도 전량 체결 확정 직후 — positions_state 재로드, 실현손익·UI 즉시 동기화.
+    목표: 1초 이내 대시보드 반영.
+    """
+    norm = normalize_code(code)
+    try:
+        reloaded = trade_state.reload_positions_state_from_disk()
+        logger.info(
+            "매도 체결 직후 positions_state 재로드: %s · %d종목",
+            norm,
+            reloaded,
+        )
+    except Exception as exc:
+        logger.warning("매도 체결 positions_state 재로드 실패 (%s): %s", norm, exc)
+    _apply_runtime_positions_from_store()
+    _force_refresh_trade_state_sync("sell_fill_confirmed")
+    _sync_positions_state()
+    trade_state.request_dashboard_refresh(f"sell:{norm or code}")
+    _refresh_balance_after_fill("sell", norm or code)
+
+
 def _force_refresh_trade_state_sync(reason: str = "") -> None:
     """체결/수량 변동 직후 정산 지표를 메모리·trade_state 기준으로 강제 동기화."""
     try:
@@ -897,10 +1006,15 @@ def fetch_instant_daily_summary_payload(*, tag: str = "장마감 직후") -> dic
     """
     from ai_briefing import build_ai_briefing_payload
 
-    trade_state.ensure_trade_state_file()
-    trade_state.force_refresh_daily_state()
-    trade_count, total_pnl, _ = trade_state.get_totals()
-    stats = {"trade_count": trade_count, "total_pnl": total_pnl}
+    try:
+        trade_state.ensure_trade_state_file()
+    except Exception:
+        pass
+    daily = trade_state.get_daily_realized_pnl(force_refresh=True)
+    stats = {
+        "trade_count": int(daily.get("today_trade_count") or 0),
+        "total_pnl": int(daily.get("today_realized_pnl") or 0),
+    }
     snap = _refresh_account_snapshot(force=True)
     with _state_lock:
         slot_count = int(_state.get("slot_count") or 0)
@@ -983,6 +1097,18 @@ def _maybe_send_daily_close_summary(now_dt: datetime) -> None:
     _last_close_summary_sent_date = today_key
     set_buy_pause(True, source="safe_exit")
     stats = get_daily_stats(force_refresh=True)
+    settlement = None
+    try:
+        from account import get_daily_trade_settlement
+
+        settlement = get_daily_trade_settlement()
+    except Exception as exc:
+        logger.debug("DB 정산 스냅샷 실패: %s", exc)
+    if settlement:
+        stats = {
+            "trade_count": int(settlement.get("trade_count") or 0),
+            "total_pnl": int(settlement.get("realized_pnl") or 0),
+        }
     with _state_lock:
         slot_count = int(_state.get("slot_count") or 0)
     snap = _refresh_account_snapshot(force=True)
@@ -990,6 +1116,69 @@ def _maybe_send_daily_close_summary(now_dt: datetime) -> None:
         tag="장마감 직후",
         **_daily_summary_from_snapshot(snap, stats=stats, slot_count=slot_count),
     )
+    _maybe_send_daily_close_report(now_dt)
+
+
+def _maybe_send_daily_close_report(now_dt: datetime) -> None:
+    """15:30 마감 직후 — DB 복기·지수·보유 MA·내일 전략 리포트."""
+    global _last_close_report_sent_date
+    if not bool(getattr(config, "ENABLE_DAILY_CLOSE_REPORT", True)):
+        return
+    if not _is_weekday():
+        return
+    today_key = now_dt.date().isoformat()
+    if _last_close_report_sent_date == today_key:
+        return
+    report_t = _parse_hhmm_safe(
+        str(getattr(config, "DAILY_CLOSE_REPORT_TIME", "15:31")), 15, 31
+    )
+    window_min = int(getattr(config, "DAILY_CLOSE_REPORT_WINDOW_MIN", 20))
+    if not _summary_send_window_ok(now_dt, start=report_t, window_min=window_min):
+        return
+    _last_close_report_sent_date = today_key
+    try:
+        from daily_close_report import build_daily_close_report
+
+        snap = _refresh_account_snapshot(force=True)
+        holdings = get_positions_snapshot()
+        report = build_daily_close_report(
+            trade_date=today_key,
+            holdings=holdings,
+            account=snap,
+        )
+        with _state_lock:
+            _state["daily_close_report"] = report
+            _state["daily_close_report_date"] = today_key
+        if bool(getattr(config, "ENABLE_NOTIFICATIONS", False)):
+            _notifier.send_daily_close_report(report)
+        trade_state.request_dashboard_refresh("daily_close_report")
+        logger.info("장 마감 AI 리포트 생성 완료 (%s)", today_key)
+    except Exception as exc:
+        logger.exception("장 마감 리포트 생성 실패: %s", exc)
+
+
+def get_daily_close_report() -> dict[str, Any] | None:
+    """UI용 최신 장마감 리포트."""
+    with _state_lock:
+        rep = _state.get("daily_close_report")
+        rep_date = _state.get("daily_close_report_date")
+    if isinstance(rep, dict) and rep.get("markdown"):
+        return dict(rep)
+    today = date.today().isoformat()
+    if rep_date == today and isinstance(rep, dict):
+        return dict(rep)
+    try:
+        from daily_close_report import load_saved_report
+
+        saved = load_saved_report(today)
+        if saved:
+            with _state_lock:
+                _state["daily_close_report"] = saved
+                _state["daily_close_report_date"] = today
+            return saved
+    except Exception:
+        pass
+    return None
 
 
 def _maybe_preopen_session_boot(now_dt: datetime) -> None:
@@ -1037,6 +1226,8 @@ def _reset_daily_stats_if_needed() -> None:
 def _bootstrap_positions_from_store() -> None:
     """메모리 포지션 스토어 → 스케줄러 _positions (기동·잔고 동기화 후)."""
     global _positions
+    from slot_registry import reconcile_holdings_to_slots
+
     persisted = trade_state.load_persisted_positions()
     token: str | None = None
     try:
@@ -1055,10 +1246,32 @@ def _bootstrap_positions_from_store() -> None:
                 _ensure_position_targets(code, pos)
             else:
                 refresh_target_live_fields(pos)
-    _maybe_persist_positions(force=True)
+    slots = trade_state.get_slots_book()
+    with _positions_lock:
+        snap = {c: dict(p) for c, p in _positions.items()}
+    reconcile_holdings_to_slots(slots, snap)
+    with _positions_lock:
+        for code, pos in snap.items():
+            if not isinstance(pos, dict):
+                continue
+            live = _positions.get(code)
+            if not isinstance(live, dict):
+                continue
+            for key in (
+                "slot_uid",
+                "slot_id",
+                "slot_type",
+                "slot_personality",
+                "display_idx",
+                "trading_mode",
+            ):
+                if pos.get(key) is not None:
+                    live[key] = pos.get(key)
+    trade_state.save_portfolio_state(
+        {c: dict(p) for c, p in _positions.items()},
+        slots,
+    )
     _sync_positions_state()
-    if persisted:
-        logger.info("보유 포지션 복구: %d종목 %s", len(persisted), list(persisted.keys()))
 
 
 def _apply_runtime_positions_from_store() -> None:
@@ -1198,6 +1411,8 @@ def _record_trade_exit(
         profit_pct=profit_pct,
         exit_type=exit_type,
         code=code,
+        sell_price=exit_price,
+        quantity=qty,
     )
     _force_refresh_trade_state_sync("record_completed_trade")
     return pnl
@@ -1231,7 +1446,7 @@ def _ws_health_snapshot() -> dict[str, Any]:
             "seconds_since_rx": None,
             "seconds_since_trade": None,
             "heartbeat_timeout_sec": float(
-                getattr(config, "WS_HEARTBEAT_TIMEOUT_SEC", 5.0)
+                getattr(config, "WS_HEARTBEAT_TIMEOUT_SEC", 20.0)
             ),
             "last_error": err,
         }
@@ -1252,7 +1467,7 @@ def _ws_health_snapshot() -> dict[str, Any]:
         "seconds_since_rx": None,
         "seconds_since_trade": None,
         "heartbeat_timeout_sec": float(
-            getattr(config, "WS_HEARTBEAT_TIMEOUT_SEC", 5.0)
+            getattr(config, "WS_HEARTBEAT_TIMEOUT_SEC", 20.0)
         ),
         "last_error": hub.last_error() if hasattr(hub, "last_error") else None,
     }
@@ -1260,18 +1475,38 @@ def _ws_health_snapshot() -> dict[str, Any]:
 
 def _sync_positions_state() -> None:
     global _last_synced_slot_count
+    from slot_registry import build_slot_layout
+
     token: str | None = None
     try:
         token = get_access_token()
     except Exception:
         pass
     with _positions_lock:
-        snapshot = [
-            enrich_position(p, access_token=token) for p in _positions.values()
-        ]
+        pos_by_code = {code: dict(p) for code, p in _positions.items()}
         count = len(_positions)
+    slots = trade_state.get_slots_book()
+    layout = build_slot_layout(pos_by_code, slots)
+    snapshot: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for cell in layout:
+        pos = cell.get("position")
+        if not isinstance(pos, dict):
+            continue
+        code = normalize_code(pos.get("code"))
+        if len(code) != 6 or code in seen:
+            continue
+        seen.add(code)
+        snapshot.append(enrich_position(pos, access_token=token))
+    for code, pos in pos_by_code.items():
+        norm = normalize_code(code)
+        if len(norm) != 6 or norm in seen:
+            continue
+        seen.add(norm)
+        snapshot.append(enrich_position(dict(pos), access_token=token))
     with _state_lock:
         _state["positions"] = snapshot
+        _state["slot_layout"] = layout
         _state["slot_count"] = count
         _state["monitoring"] = count > 0
     if _last_synced_slot_count != count:
@@ -1334,7 +1569,7 @@ def _process_pyramid_for_code(code: str) -> None:
     if not pos:
         return
     mode = position_trading_mode(pos)
-    if mode == "scalping":
+    if mode == "day_trading":
         return
     if pos.get("pyramid_done") and mode != "long_term":
         return
@@ -1417,6 +1652,11 @@ def _ensure_position_targets(code: str, position: dict[str, Any]) -> None:
 
 
 def update_position_trading_mode(code: str, trading_mode: str) -> dict[str, Any]:
+    return _apply_live_mode_to_position_code(code, trading_mode)
+
+
+def _apply_live_mode_to_position_code(code: str, trading_mode: str) -> dict[str, Any]:
+    """보유 종목 — 실시간 슬롯 성격을 포지션 전술(손절/익절/보유)에 즉시 반영."""
     norm = normalize_code(code)
     mode_value = _normalize_trading_mode(trading_mode, fallback=TradingMode.SWING.value)
     with _positions_lock:
@@ -1424,6 +1664,9 @@ def update_position_trading_mode(code: str, trading_mode: str) -> dict[str, Any]
         if not pos:
             return {"success": False, "message": "보유 포지션을 찾을 수 없습니다."}
         pos.update(_mode_tags_for_value(mode_value))
+        pos["trading_mode"] = mode_value
+        pos["slot_type"] = mode_value
+        pos["slot_id"] = mode_value
         try:
             from selected_modes import save_mode
 
@@ -1443,6 +1686,7 @@ def update_position_trading_mode(code: str, trading_mode: str) -> dict[str, Any]
     _maybe_persist_positions(force=True)
     _sync_positions_state()
     _update_engine_mode_from_state()
+    _wake_engine()
     return {
         "success": True,
         "message": f"{snapshot.get('name', norm)} 모드를 {snapshot.get('mode_label', '스윙')}로 변경했습니다.",
@@ -1450,7 +1694,112 @@ def update_position_trading_mode(code: str, trading_mode: str) -> dict[str, Any]
     }
 
 
-def _add_position(position: dict[str, Any]) -> None:
+def set_slot_personality(slot_idx: int, mode_label: str) -> dict[str, Any]:
+    """
+    슬롯 실시간 모드 변경 — empty/filled 공통.
+    slots book → positions_state.json → (보유 시) 포지션 전술 즉시 갱신.
+    """
+    from slot_registry import (
+        set_slot_personality_in_book,
+        slot_uid_for_display_idx,
+    )
+    from trading_categories import normalize_trading_category
+
+    idx = int(slot_idx)
+    uid = slot_uid_for_display_idx(idx)
+    if not uid:
+        return {"success": False, "message": "슬롯 번호가 올바르지 않습니다."}
+
+    label = str(mode_label or "").strip()
+    from selected_modes import MODE_LABELS
+
+    if label not in MODE_LABELS:
+        label = MODE_LABEL_KO.get(TradingMode.SWING, "스윙")
+
+    mode_value = normalize_trading_category(_normalize_trading_mode(label))
+
+    slots = trade_state.get_slots_book()
+    if not set_slot_personality_in_book(slots, uid, mode_value):
+        return {"success": False, "message": f"슬롯 {idx} 성격 저장 실패"}
+
+    try:
+        from selected_modes import sync_slot_mode
+
+        sync_slot_mode(idx, label, None)
+    except ImportError:
+        pass
+
+    held_code: str | None = None
+    entry = slots.get(uid) or {}
+    if str(entry.get("status") or "empty") == "filled":
+        held_code = str(entry.get("code") or "").strip() or None
+
+    with _positions_lock:
+        if held_code and held_code in _positions:
+            pos = _positions[held_code]
+            pos.update(_mode_tags_for_value(mode_value))
+            pos["trading_mode"] = mode_value
+            pos["slot_type"] = mode_value
+            pos["slot_id"] = mode_value
+            pos["slot_uid"] = uid
+            pos["updated_at"] = _now_text()
+            pos.pop("target_price", None)
+            pos.pop("target_profit_pct", None)
+            pos.pop("target_kind", None)
+            pos.pop("target_note", None)
+            pos.pop("target_display", None)
+            pos.pop("target_ceiling_price", None)
+            apply_tactical_fields_on_position(pos)
+            apply_expected_exit_to_position(pos, hourly_bars=None, force_recalc=True)
+        snap = {c: dict(p) for c, p in _positions.items()}
+
+    trade_state.save_portfolio_state(snap, slots)
+    _sync_positions_state()
+    _update_engine_mode_from_state()
+    _wake_engine()
+
+    ko = MODE_LABEL_KO.get(
+        next((m for m in TradingMode if m.value == mode_value), TradingMode.SWING),
+        label,
+    )
+    return {
+        "success": True,
+        "message": f"슬롯 {idx} 실시간 모드 → {ko} ({mode_value})",
+        "slot_uid": uid,
+        "trading_mode": mode_value,
+        "held_code": held_code,
+    }
+
+
+def _sync_position_live_mode_from_slot(code: str) -> None:
+    """매도 판정 직전 — slots book 최신 성격으로 포지션 전술 동기화."""
+    from slot_registry import resolve_live_trading_mode_for_position
+    from trading_categories import normalize_trading_category
+
+    norm = normalize_code(code)
+    with _positions_lock:
+        pos = _positions.get(norm)
+        if not pos:
+            return
+        live_mode = normalize_trading_category(
+            resolve_live_trading_mode_for_position(dict(pos))
+        )
+        cur = normalize_trading_category(pos.get("trading_mode"))
+        if cur == live_mode and normalize_trading_category(pos.get("slot_type")) == live_mode:
+            return
+        pos.update(_mode_tags_for_value(live_mode))
+        pos["trading_mode"] = live_mode
+        pos["slot_type"] = live_mode
+        pos["slot_id"] = live_mode
+        apply_tactical_fields_on_position(pos)
+        apply_expected_exit_to_position(pos, hourly_bars=None, force_recalc=True)
+        pos["updated_at"] = _now_text()
+
+
+def _add_position(position: dict[str, Any], *, slot_id: str | None = None) -> None:
+    from slot_registry import assign_slot, slot_spec
+    from trading_categories import normalize_trading_category
+
     code = position["code"]
     token: str | None = None
     try:
@@ -1472,13 +1821,33 @@ def _add_position(position: dict[str, Any]) -> None:
         fallback=TradingMode.SWING.value,
     )
     position = apply_tactical_fields_on_position(position)
-    mode = position_trading_mode(position)
+    mode = normalize_trading_category(position_trading_mode(position))
+    position["trading_mode"] = mode
     if mode == "swing" and not position.get("stop_loss_price"):
         _backfill_missing_atr_stop(code, position)
     _ensure_position_targets(code, position)
+
+    slot_uid = str(position.get("slot_uid") or slot_id or "").strip()
+    slots = trade_state.get_slots_book()
+    cat = mode
+    if slot_uid:
+        spec = slot_spec(slot_uid, slots) or {}
+        if spec:
+            cat = normalize_trading_category(spec.get("slot_personality") or spec.get("slot_type"))
+            position["slot_uid"] = slot_uid
+            position["slot_id"] = cat
+            position["slot_type"] = cat
+            position["slot_personality"] = cat
+            position["display_idx"] = spec.get("display_idx")
+            position["trading_mode"] = cat
+            position.update(_mode_tags_for_value(cat))
+        assign_slot(slots, slot_uid, code, trading_mode=cat)
+
     with _positions_lock:
         _positions[code] = position
-    _maybe_persist_positions(force=True)
+    with _positions_lock:
+        snapshot = {c: dict(p) for c, p in _positions.items()}
+    trade_state.save_portfolio_state(snapshot, slots)
     _sync_positions_state()
 
 
@@ -1592,14 +1961,26 @@ def _apply_confirmed_buy_fill(order: dict[str, Any], holding: dict[str, Any]) ->
         fill_price,
         entry_basis=str(order.get("entry_basis") or "async_fill_confirmed"),
     )
-    _add_position(payload)
+    slot_uid = str(
+        order.get("slot_uid") or payload.get("slot_uid") or order.get("slot_id") or ""
+    ).strip()
+    _add_position(payload, slot_id=slot_uid or None)
     msg = (
         f"[체결완료] {payload['name']}({code}) {fill_qty}주 · "
         f"평단 {fill_price:,}원"
     )
     _record_job_success(msg)
+    try:
+        trade_state.save_trade_record(
+            stock_name=str(payload.get("name") or code),
+            side="buy",
+            price=fill_price,
+            quantity=fill_qty,
+            stock_code=code,
+        )
+    except Exception as exc:
+        logger.debug("매수 체결 DB 저장 스킵: %s", exc)
     _safe_notify_fill(
-        "매수",
         code,
         str(payload.get("name") or code),
         fill_qty,
@@ -1626,6 +2007,16 @@ def _apply_confirmed_pyramid_fill(order: dict[str, Any], holding: dict[str, Any]
     _clear_position_order_pending(code, str(order.get("ticket_id")))
     msg = f"[피라미딩 체결] {holding.get('name', code)}({code}) +{fill_qty}주"
     _record_job_success(msg)
+    try:
+        trade_state.save_trade_record(
+            stock_name=str(holding.get("name") or code),
+            side="buy",
+            price=fill_price,
+            quantity=fill_qty,
+            stock_code=code,
+        )
+    except Exception as exc:
+        logger.debug("피라미딩 체결 DB 저장 스킵: %s", exc)
     _safe_notify_fill(
         "추가매수",
         code,
@@ -1669,6 +2060,7 @@ def _apply_confirmed_sell_fill(order: dict[str, Any], remaining_qty: int) -> str
 
     with _positions_lock:
         live = _positions.get(code)
+        released_slot: str | None = None
         if live:
             live_qty = int(live.get("quantity") or 0)
             new_qty = max(0, live_qty - sold_qty)
@@ -1678,6 +2070,13 @@ def _apply_confirmed_sell_fill(order: dict[str, Any], remaining_qty: int) -> str
                 live["long_force_exit_stage"] = done + 1
                 live["long_force_exit_at"] = _now_text()
             if new_qty <= 0 or remaining_qty <= 0:
+                released_slot = str(
+                    live.get("slot_uid")
+                    or order.get("slot_uid")
+                    or order.get("slot_id")
+                    or live.get("slot_id")
+                    or ""
+                ).strip() or None
                 _positions.pop(code, None)
             else:
                 live["quantity"] = remaining_qty
@@ -1685,8 +2084,16 @@ def _apply_confirmed_sell_fill(order: dict[str, Any], remaining_qty: int) -> str
                 live.pop("pending_order_ticket", None)
                 live.pop("pending_order_action", None)
                 live.pop("pending_order_at", None)
-    _maybe_persist_positions(force=True)
-    _sync_positions_state()
+    if released_slot:
+        from slot_registry import release_slot
+
+        slots = trade_state.get_slots_book()
+        release_slot(slots, released_slot)
+        with _positions_lock:
+            snap = {c: dict(p) for c, p in _positions.items()}
+        trade_state.save_portfolio_state(snap, slots)
+    else:
+        _maybe_persist_positions(force=True)
     msg = (
         f"[매도체결] {pos.get('name', code)}({code}) {sold_qty}주 · "
         f"수익률 {profit_pct:+.2f}% · 실현손익 {pnl:+,}원"
@@ -1700,7 +2107,7 @@ def _apply_confirmed_sell_fill(order: dict[str, Any], remaining_qty: int) -> str
         price=exit_price,
         profit_pct=profit_pct,
     )
-    _refresh_balance_after_fill("sell", code)
+    _sync_after_sell_fill_confirmed(code)
     return msg
 
 
@@ -1780,6 +2187,48 @@ def _sell_position_by_code(
     return f"[{reason}] {code} 매도 주문 접수 · 티켓 {order['ticket_id']}"
 
 
+def _get_daily_bars_cached(token: str, code: str) -> list[dict[str, Any]]:
+    """폴링 모드 일봉 — 종목별 TTL 캐시."""
+    norm = normalize_code(code)
+    ttl = float(getattr(config, "POLLING_DAILY_BARS_CACHE_SEC", 300))
+    lookback = int(getattr(config, "POLLING_DAILY_LOOKBACK_DAYS", 90))
+    now = time.time()
+    cached = _daily_bars_cache.get(norm)
+    if cached and now - cached[0] < ttl:
+        return list(cached[1])
+    from stock_daily import fetch_daily_ohlc_bars
+
+    bars = fetch_daily_ohlc_bars(
+        token,
+        config.APP_KEY,
+        config.APP_SECRET,
+        norm,
+        lookback_days=lookback,
+    )
+    _daily_bars_cache[norm] = (now, bars)
+    return bars
+
+
+def _polling_refresh_balance_if_due() -> None:
+    """폴맹 모드 — 주기적 inquire_balance·포지션 동기화."""
+    global _last_balance_poll_at
+    if not is_polling_strategy_mode():
+        return
+    interval = float(getattr(config, "POLLING_BALANCE_INTERVAL_SEC", 30))
+    if time.time() - _last_balance_poll_at < interval:
+        return
+    _last_balance_poll_at = time.time()
+    try:
+        _refresh_account_snapshot(
+            force=False,
+            sync_runtime_positions=True,
+            bump_positions_revision=False,
+        )
+        _apply_runtime_positions_from_store()
+    except Exception as exc:
+        logger.debug("폴링 잔고 동기화 실패: %s", exc)
+
+
 def _evaluate_positions() -> None:
     positions = _get_all_positions()
     if not positions:
@@ -1800,23 +2249,31 @@ def _evaluate_positions() -> None:
             fresh = _get_all_positions().get(code)
             if not fresh:
                 continue
+            _sync_position_live_mode_from_slot(code)
+            fresh = _get_all_positions().get(code) or fresh
             minute_bars = None
             hourly_bars = None
+            daily_bars = None
             if requires_fast_tick_exit(fresh):
                 minute_bars = _get_scalp_minute_bars_cached(token, code)
-            if requires_hourly_bars(fresh):
+            if requires_hourly_bars(fresh) and not requires_daily_bars(fresh):
                 try:
                     hourly_bars = _fetch_hourly_bars(
                         token, config.APP_KEY, config.APP_SECRET, code
                     )
                 except Exception:
                     hourly_bars = None
+            if requires_daily_bars(fresh):
+                daily_bars = _get_daily_bars_cached(token, code)
+            elif requires_hourly_bars(fresh) and is_polling_strategy_mode():
+                daily_bars = _get_daily_bars_cached(token, code)
             reason = decide_position_exit(
                 fresh,
                 current,
                 profit_pct,
                 minute_bars=minute_bars,
                 hourly_bars=hourly_bars,
+                daily_bars=daily_bars,
             )
             if reason:
                 to_sell.append((code, reason))
@@ -1833,8 +2290,66 @@ def _evaluate_positions() -> None:
                 logger.info(msg)
 
 
-def _empty_slots() -> int:
-    return max(0, MAX_SLOTS - _get_position_count() - _pending_entry_order_count())
+def _pending_reserved_slot_ids() -> set[str]:
+    from trading_categories import migrate_legacy_slot_uid
+
+    reserved: set[str] = set()
+    with _orders_lock:
+        for order in _orders.values():
+            if not _is_open_order_status(str(order.get("status"))):
+                continue
+            if str(order.get("action")) not in {"buy", "pyramid_buy"}:
+                continue
+            raw = str(order.get("slot_uid") or order.get("slot_id") or "").strip()
+            uid = migrate_legacy_slot_uid(raw) or raw
+            if uid:
+                reserved.add(uid)
+    return reserved
+
+
+def _resolve_buy_slot_id(pick: dict[str, Any]) -> str | None:
+    """타입 일치 empty slot_uid — long_term / swing / day_trading."""
+    from slot_registry import find_empty_slot_for_mode, is_slot_empty
+    from trading_categories import migrate_legacy_slot_uid
+
+    slots = trade_state.get_slots_book()
+    reserved = _pending_reserved_slot_ids()
+    mode = pick.get("trading_mode") or pick.get("selected_trading_mode")
+    preferred = pick.get("slot_uid") or migrate_legacy_slot_uid(pick.get("slot_id"))
+    ui_idx = pick.get("ui_slot_index")
+    sid = find_empty_slot_for_mode(
+        slots,
+        mode,
+        preferred_slot_uid=str(preferred) if preferred else None,
+        preferred_display_idx=int(ui_idx) if ui_idx else None,
+    )
+    if sid and sid in reserved:
+        sid = find_empty_slot_for_mode(slots, mode)
+    if not sid or sid in reserved:
+        return None
+    if not is_slot_empty(slots, sid):
+        return None
+    return sid
+
+
+def _empty_slots(*, trading_mode: str | None = None) -> int:
+    from slot_registry import count_empty_slots, normalize_slot_type, slot_type_matches
+
+    slots = trade_state.get_slots_book()
+    reserved = _pending_reserved_slot_ids()
+    mode_filter = normalize_slot_type(trading_mode) if trading_mode else None
+    empty = count_empty_slots(slots, slot_type=mode_filter)
+    if not reserved:
+        return empty
+    blocked = 0
+    for sid in reserved:
+        entry = slots.get(sid)
+        if not entry or str(entry.get("status") or "empty") != "empty":
+            continue
+        if mode_filter and not slot_type_matches(str(entry.get("slot_type")), mode_filter):
+            continue
+        blocked += 1
+    return max(0, empty - blocked)
 
 
 def _capital_snapshot_with_pending() -> dict[str, int]:
@@ -1929,7 +2444,7 @@ def _execute_pick_entry(token: str, pick: dict[str, Any]) -> dict[str, Any] | No
         return None
 
     mode = str(pick.get("trading_mode") or "swing")
-    use_market = mode == "scalping" and getattr(
+    use_market = mode == "day_trading" and getattr(
         config, "SCALP_USE_MARKET_ORDER", True
     )
     if use_market:
@@ -2033,6 +2548,7 @@ def _enqueue_intent(intent: dict[str, Any]) -> dict[str, Any]:
         )
     _order_queue.put({"ticket_id": order["ticket_id"]})
     _wake_engine()
+    _wake_order_fill_poller()
     return order
 
 
@@ -2049,6 +2565,42 @@ def _enqueue_pick_entry(
         return None
     estimate = _estimate_buy_intent(pick)
     prepared_pick = dict(estimate.get("pick") or pick)
+    slot_uid = _resolve_buy_slot_id(prepared_pick)
+    if not slot_uid:
+        return None
+    from slot_registry import display_idx_for_slot_uid, slot_spec
+    from trading_categories import normalize_trading_category
+
+    slots = trade_state.get_slots_book()
+    spec = slot_spec(slot_uid, slots) or {}
+    cat = normalize_trading_category(
+        spec.get("slot_personality") or spec.get("slot_type") or prepared_pick.get("trading_mode")
+    )
+    prepared_pick = _apply_trading_mode_override(prepared_pick, cat, fallback=cat)
+    prepared_pick["slot_uid"] = slot_uid
+    prepared_pick["slot_id"] = cat
+    ui_idx = display_idx_for_slot_uid(slot_uid)
+    if ui_idx:
+        prepared_pick["ui_slot_index"] = ui_idx
+
+    if is_polling_strategy_mode():
+        if cat == "day_trading" and getattr(config, "POLLING_DISABLE_DAY_TRADING", True):
+            logger.info("폴링 모드 — 단타 슬롯 진입 스킵 %s", code)
+            return None
+        try:
+            token = get_access_token()
+            daily = _get_daily_bars_cached(token, code)
+            if not passes_polling_entry_ma_filter(cat, daily):
+                logger.info(
+                    "폴링 MA 미충족 — 진입 스킵 %s (%s)",
+                    code,
+                    prepared_pick.get("name") or code,
+                )
+                return None
+        except Exception as exc:
+            logger.warning("폴링 MA 검증 실패 %s: %s", code, exc)
+            return None
+
     intent = {
         "action": "buy",
         "code": code,
@@ -2062,6 +2614,8 @@ def _enqueue_pick_entry(
         "trading_mode": prepared_pick.get("trading_mode"),
         "mode_label": prepared_pick.get("mode_label"),
         "baseline_qty": 0,
+        "slot_uid": slot_uid,
+        "slot_id": cat,
         "message": "주문 접수 대기",
     }
     return _enqueue_intent(intent)
@@ -2297,13 +2851,18 @@ def _poll_pending_orders_once() -> None:
             msg = _apply_confirmed_sell_fill(order, current_qty)
             _update_order_state(ticket_id, status="filled", message=msg)
             _clear_position_order_pending(code, ticket_id)
-            _force_refresh_trade_state_sync("sell_fill_detected")
+            _publish_order_snapshot()
 
 
 def _order_fill_loop() -> None:
     while True:
         _poll_pending_orders_once()
-        time.sleep(ORDER_STATUS_POLL_SEC)
+        if _has_pending_orders():
+            if _order_fill_wake.wait(timeout=ORDER_FILL_POLL_ACTIVE_SEC):
+                _order_fill_wake.clear()
+        else:
+            if _order_fill_wake.wait(timeout=ORDER_STATUS_POLL_SEC):
+                _order_fill_wake.clear()
 
 
 def _start_order_workers_if_needed() -> None:
@@ -2390,7 +2949,8 @@ def _run_market_scan_and_buy(*, force: bool = False) -> dict[str, Any]:
                 f"후보 0 · 보유 {len(held)}/{MAX_SLOTS}"
                 if force
                 else (
-                    f"후보 없음 (보유 {len(held)}/{MAX_SLOTS} · 실시간 단타+1H스윙)"
+                    f"후보 없음 (보유 {len(held)}/{MAX_SLOTS} · "
+                    f"{'스윙/장투 MA' if is_polling_strategy_mode() else '실시간 단타+1H스윙'})"
                 )
             )
             _mark_scan_completed(summary)
@@ -2722,7 +3282,7 @@ def _update_engine_mode_from_state() -> None:
         _set_engine_mode("monitoring")
     elif count > 0:
         modes = {str(p.get("trading_mode") or "swing") for p in _get_all_positions().values()}
-        if "scalping" in modes:
+        if "day_trading" in modes:
             _set_engine_mode("scalp_watch")
         else:
             _set_engine_mode("swing_active")
@@ -2749,6 +3309,8 @@ def _handle_ws_tick(code: str, price: int) -> None:
                 _update_position_market(code, price, profit_pct)
                 fresh = _get_all_positions().get(code)
                 if fresh:
+                    _sync_position_live_mode_from_slot(code)
+                    fresh = _get_all_positions().get(code) or fresh
                     minute_bars = None
                     hourly_bars = None
                     if requires_fast_tick_exit(fresh):
@@ -2862,13 +3424,18 @@ def _run_realtime_cycle() -> None:
 
     positions = list(_get_all_positions().values())
     ws_ok = _realtime_ws_ready()
+    polling = is_polling_strategy_mode()
 
     try:
         _process_theme_timeline()
     except Exception as exc:
         logger.warning("테마 타임라인 처리 실패: %s", exc)
 
-    if positions and not ws_ok:
+    if polling:
+        _polling_refresh_balance_if_due()
+
+    need_poll_eval = positions and (polling or not ws_ok)
+    if need_poll_eval:
         poll_interval = max(
             monitor_interval_for_positions(positions),
             float(MONITOR_INTERVAL_SEC),
@@ -2884,7 +3451,7 @@ def _run_realtime_cycle() -> None:
     elif positions and ws_ok:
         _last_monitor_at = time.time()
 
-    if not ws_ok:
+    if polling or not ws_ok:
         try:
             _process_pyramid_additions()
         except Exception as exc:
@@ -2900,7 +3467,8 @@ def _run_realtime_cycle() -> None:
         _update_engine_mode_from_state()
 
     _sync_positions_state()
-    _sync_ws_watchlist()
+    if not polling:
+        _sync_ws_watchlist()
 
 
 def _realtime_engine_loop() -> None:
@@ -2929,6 +3497,7 @@ def _realtime_engine_loop() -> None:
         _maybe_preopen_session_boot(now_dt)
         _maybe_send_market_open_summary(now_dt)
         _maybe_send_daily_close_summary(now_dt)
+        _maybe_send_daily_close_report(now_dt)
         now_t = now_dt.time()
         ws_ok = _realtime_ws_ready()
 
@@ -2961,11 +3530,16 @@ def _realtime_engine_loop() -> None:
         except Exception as exc:
             logger.exception("실시간 엔진 틱 오류: %s", exc)
 
-        if ws_ok:
+        if ws_ok and not is_polling_strategy_mode():
             _engine_wake.wait(timeout=WS_ENGINE_WAIT_SEC)
             _engine_wake.clear()
         else:
-            time.sleep(REALTIME_ENGINE_TICK_SEC)
+            tick = float(
+                getattr(config, "REALTIME_ENGINE_TICK_SEC", 8.0)
+                if is_polling_strategy_mode()
+                else REALTIME_ENGINE_TICK_SEC
+            )
+            time.sleep(tick)
 
 
 def start_background_scheduler() -> None:
@@ -3002,8 +3576,14 @@ def start_background_scheduler() -> None:
 def _start_realtime_websocket_if_enabled() -> None:
     global _ws_hub
     if not getattr(config, "USE_REALTIME_WEBSOCKET", True):
+        label = (
+            "폴링 모드 (스윙/장투 · "
+            f"{getattr(config, 'POLLING_POSITION_INTERVAL_SEC', 8):.0f}초 감시)"
+            if getattr(config, "POLLING_STRATEGY_MODE", False)
+            else "WS 비활성 (REST 감시)"
+        )
         with _state_lock:
-            _state["ws_status"] = "WS 비활성 (REST 감시)"
+            _state["ws_status"] = label
             _state["ws_last_error"] = None
         return
     try:
@@ -3023,6 +3603,10 @@ def _start_realtime_websocket_if_enabled() -> None:
             app_secret=config.APP_SECRET,
             on_trade=_handle_ws_tick,
             on_status=on_status,
+            on_reconnected=_sync_balance_after_ws_reconnect,
+            heartbeat_timeout_sec=float(
+                getattr(config, "WS_HEARTBEAT_TIMEOUT_SEC", 20.0)
+            ),
         )
         if hub.start():
             _ws_hub = hub
@@ -3082,6 +3666,20 @@ def get_positions_snapshot() -> list[dict[str, Any]]:
         return [dict(p) for p in _state.get("positions", [])]
 
 
+def get_slot_layout_snapshot() -> list[dict[str, Any]]:
+    """display_idx 순 고정 5칸 — empty/filled + slot_id."""
+    with _state_lock:
+        rows = _state.get("slot_layout") or []
+    if rows:
+        return [dict(r) for r in rows if isinstance(r, dict)]
+    from slot_registry import build_slot_layout
+
+    with _positions_lock:
+        pos_by_code = {code: dict(p) for code, p in _positions.items()}
+    slots = trade_state.get_slots_book()
+    return build_slot_layout(pos_by_code, slots)
+
+
 def get_position_snapshot() -> dict[str, Any] | None:
     positions = get_positions_snapshot()
     return positions[0] if positions else None
@@ -3106,8 +3704,6 @@ def manual_buy_recommended_pick(
     code = normalize_code(candidate.get("code"))
     if len(code) != 6:
         return {"success": False, "message": "추천 종목 코드가 올바르지 않습니다."}
-    if _empty_slots() <= 0:
-        return {"success": False, "message": "빈 슬롯이 없습니다."}
     if code in _get_held_codes():
         return {"success": False, "message": "이미 보유 중인 종목입니다."}
     if not (_is_weekday() and _in_scan_window(datetime.now().time())):
@@ -3126,6 +3722,24 @@ def manual_buy_recommended_pick(
             or pick.get("trading_mode")
             or TradingMode.SWING.value
         )
+        if slot_idx is not None and int(slot_idx) > 0:
+            from slot_registry import slot_spec_for_display_idx, slot_type_matches
+
+            spec = slot_spec_for_display_idx(int(slot_idx), trade_state.get_slots_book())
+            sid = str(spec.get("slot_uid") or "") if spec else ""
+            if spec and not slot_type_matches(spec.get("slot_type"), selected_mode):
+                return {
+                    "success": False,
+                    "message": (
+                        f"슬롯 {slot_idx}({spec.get('slot_id')})는 "
+                        f"{spec.get('slot_type')} 전용입니다. 다른 타입 종목은 배치할 수 없습니다."
+                    ),
+                }
+        if _empty_slots(trading_mode=selected_mode) <= 0:
+            return {
+                "success": False,
+                "message": f"{selected_mode} 타입 빈 슬롯이 없습니다.",
+            }
         selected_label = _mode_tags_for_value(selected_mode)["mode_label"]
         order_info = _enqueue_pick_entry(
             pick,
