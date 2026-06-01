@@ -16,7 +16,8 @@ def main() -> None:
     else:
         print("삭제할 토큰 캐시 파일이 없습니다.")
 
-    print("\n새 접근 토큰 발급 중...")
+    print("\n새 접근 토큰 발급 중... (1분당 1회 — EGW00133 주의)")
+    print("방금 auth.py 를 실행했다면 65초 정도 기다린 뒤 다시 시도하세요.")
     try:
         token = get_access_token(force_refresh=True)
         print(f"신규 토큰 발급 성공 (앞 12자): {token[:12]}...")

@@ -4,4 +4,7 @@ services:
     env: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: python scheduler.py
+    startCommand: python -u scheduler.py
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"

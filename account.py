@@ -177,6 +177,14 @@ def _parse_balance_response(response: requests.Response) -> dict:
     msg_cd = str(data.get("msg_cd") or "")
     msg1 = str(data.get("msg1") or "알 수 없는 오류")
 
+    if response.status_code == 403:
+        raise KISApiError(
+            f"잔고 조회 403 Forbidden [{msg_cd}]: {msg1}",
+            msg_cd=msg_cd,
+            http_status=403,
+            token_expired=True,
+        )
+
     if rt_cd == "0":
         return data
 
@@ -226,18 +234,21 @@ def inquire_balance(access_token: str, tr_cont: str = "") -> dict:
 
 
 def inquire_balance_with_retry(access_token: str | None = None) -> dict:
-    """만료 토큰(HTTP 500·EGW00123 등) 시 캐시 삭제 후 1회 재시도."""
-    from auth import get_access_token, invalidate_access_token
+    """만료·403 시 캐시 삭제 후 신규 토큰으로 1회 재시도."""
+    from auth import get_access_token, refresh_access_token_after_forbidden
 
     token = (access_token or "").strip() or get_access_token()
     try:
         return inquire_balance(token)
     except KISApiError as exc:
+        if exc.http_status == 403:
+            logger.warning("잔고 조회 403 Forbidden — 토큰 캐시 삭제 후 재발급")
+            fresh = refresh_access_token_after_forbidden()
+            return inquire_balance(fresh)
         if not exc.token_expired:
             raise
         logger.warning("잔고 조회 토큰 만료 — 재발급 후 재시도 (%s)", exc.msg_cd)
-        invalidate_access_token()
-        fresh = get_access_token(force_refresh=True)
+        fresh = refresh_access_token_after_forbidden()
         return inquire_balance(fresh)
 
 

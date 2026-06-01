@@ -4,3 +4,4 @@ streamlit
 streamlit-autorefresh
 websocket-client
 discord.py
+python-dotenv

@@ -3077,8 +3077,19 @@ def emergency_liquidate_all() -> dict[str, Any]:
 
 
 if __name__ == "__main__":
+    import os
+    import sys
+
+    # Render 등 클라우드에서 stdout 버퍼링으로 로그가 지연되는 것 방지
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
     try:
-        print("🚀 scheduler.py 단독 실행 시작")
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except (AttributeError, OSError):
+        pass
+
+    try:
+        print("🚀 scheduler.py 단독 실행 시작", flush=True)
         # KIS 연결 사전 점검: 인증/계좌/응답 메시지를 터미널에 강제 노출.
         try:
             token = get_access_token()

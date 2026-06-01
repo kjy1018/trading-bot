@@ -1,7 +1,8 @@
 Render.com Background Worker 배포 가이드
 
 1) 배포 진입점
-- Start Command: python scheduler.py
+- Start Command: python -u scheduler.py
+- (권장) Environment: PYTHONUNBUFFERED=1  ← Render 로그 실시간 출력
 
 2) 빌드 명령
 - Build Command: pip install -r requirements.txt

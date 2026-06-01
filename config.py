@@ -1,16 +1,22 @@
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# 프로젝트 루트 .env 로드 (Streamlit/scheduler 직접 실행 시 환경변수 주입)
+load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 
 # config.py — 한국투자증권 모의투자 · 스윙 매매
 
-APP_KEY = os.environ.get("APP_KEY")
-APP_SECRET = os.environ.get("APP_SECRET")
+APP_KEY = str(os.environ.get("APP_KEY", "")).strip()
+APP_SECRET = str(os.environ.get("APP_SECRET", "")).strip()
 
 # [수정됨] 계좌번호 앞뒤에 숨겨진 공백이 들어가서 8자리로 인식 안 되던 문제 해결 (.strip() 추가)
-ACCOUNT_NO = str(os.environ.get("ACCOUNT_NO")).strip()  # 종합계좌번호 앞 8자리 (CANO)
+ACCOUNT_NO = str(os.environ.get("ACCOUNT_NO", "")).strip()  # 종합계좌번호 앞 8자리 (CANO)
 ACCOUNT_PROD_CODE = "01"  # 계좌상품코드 뒤 2자리 (ACNT_PRDT_CD)
 
 # 잔고조회(inquire-balance)에는 미사용. 주문 API 확장 시 참고용.
-TRADE_PWD = str(os.environ.get("TRADE_PWD")).strip()
+TRADE_PWD = str(os.environ.get("TRADE_PWD", "")).strip()
 BASE_URL = "https://openapivts.koreainvestment.com:29443"
 
 # 국내주식 실시간 체결가 WebSocket (모의: kis_devlp.yaml vops)
