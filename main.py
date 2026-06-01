@@ -1458,6 +1458,48 @@ def _commander_pnl_live_panel() -> None:
         )
 
 
+@st.fragment(run_every=timedelta(seconds=2))
+def _ws_live_status_panel() -> None:
+    """Heartbeat 기반 WS 상태 — 연결 open ≠ 정상 수신."""
+    status = get_scheduler_status()
+    health = status.get("ws_health") or {}
+    alive = bool(health.get("alive"))
+    reconnecting = bool(health.get("reconnecting"))
+    connected = bool(health.get("connected"))
+    label = str(health.get("status_label") or status.get("ws_status") or "WS 상태 확인 중")
+    err = health.get("last_error") or status.get("ws_last_error")
+    gap = health.get("seconds_since_rx")
+    timeout = float(health.get("heartbeat_timeout_sec") or getattr(config, "WS_HEARTBEAT_TIMEOUT_SEC", 5))
+
+    banner = st.empty()
+    with banner.container():
+        if not getattr(config, "USE_REALTIME_WEBSOCKET", True):
+            st.info("실시간 WS 비활성 — REST 폴백 감시 모드")
+            return
+
+        gap_text = f" · 마지막 수신 {float(gap):.0f}초 전" if gap is not None else ""
+
+        if alive:
+            with st.status(f"🟢 {label}{gap_text}", state="complete"):
+                st.caption(
+                    f"Heartbeat 정상 (한도 {timeout:.0f}초) · "
+                    f"체결 틱 즉시 판정 활성"
+                )
+        elif reconnecting or not connected:
+            with st.status("🔴 WS 연결 끊김 (재연결 중...)", state="error"):
+                st.write(label + gap_text)
+                if err:
+                    st.caption(str(err))
+        else:
+            with st.status("🟡 WS 연결됨 · 데이터 수신 없음", state="running"):
+                st.write(label + gap_text)
+                st.caption(
+                    f"{timeout:.0f}초 동안 수신 없으면 자동 ws.close() 후 재접속"
+                )
+                if err:
+                    st.caption(str(err))
+
+
 @st.fragment(run_every=timedelta(seconds=5))
 def _header_panel() -> None:
     status = get_scheduler_status()
@@ -1493,11 +1535,6 @@ def _header_panel() -> None:
             f"</div>",
             unsafe_allow_html=True,
         )
-        if status.get("ws_status"):
-            ws_line = f"실시간 WS: {status['ws_status']}"
-            if status.get("ws_last_error"):
-                ws_line += f" — {status['ws_last_error']}"
-            st.caption(ws_line)
         summary = (
             st.session_state.get("last_force_scan_summary")
             or timing.get("last_scan_summary")
@@ -1648,6 +1685,7 @@ cached_token = st.session_state.get("access_token")
 token = str(cached_token) if cached_token else None
 
 _ui_snapshot_watchdog()
+_render_section_safely("실시간 WS", _ws_live_status_panel, divider_after=True)
 _render_section_safely("실시간 잔고 전광판", _hero_balance_panel)
 _render_section_safely("지휘관 실시간 수익률", _commander_pnl_live_panel)
 _render_section_safely("상단 현황판", _header_panel, divider_after=True)

@@ -1196,6 +1196,47 @@ def _realtime_ws_ready() -> bool:
     )
 
 
+def _ws_health_snapshot() -> dict[str, Any]:
+    hub = _ws_hub
+    if hub is None:
+        with _state_lock:
+            status = str(_state.get("ws_status") or "WS 미기동")
+            err = _state.get("ws_last_error")
+        return {
+            "connected": False,
+            "alive": False,
+            "reconnecting": "재연결" in status or "시도" in status,
+            "status_label": status,
+            "seconds_since_rx": None,
+            "seconds_since_trade": None,
+            "heartbeat_timeout_sec": float(
+                getattr(config, "WS_HEARTBEAT_TIMEOUT_SEC", 5.0)
+            ),
+            "last_error": err,
+        }
+    if hasattr(hub, "health_snapshot"):
+        snap = hub.health_snapshot()
+        with _state_lock:
+            _state["ws_status"] = str(snap.get("status_label") or _state.get("ws_status"))
+            if snap.get("last_error"):
+                _state["ws_last_error"] = snap.get("last_error")
+            elif snap.get("alive"):
+                _state["ws_last_error"] = None
+        return snap
+    return {
+        "connected": bool(getattr(hub, "is_connected", lambda: False)()),
+        "alive": _realtime_ws_ready(),
+        "reconnecting": False,
+        "status_label": "WS 상태 확인 중",
+        "seconds_since_rx": None,
+        "seconds_since_trade": None,
+        "heartbeat_timeout_sec": float(
+            getattr(config, "WS_HEARTBEAT_TIMEOUT_SEC", 5.0)
+        ),
+        "last_error": hub.last_error() if hasattr(hub, "last_error") else None,
+    }
+
+
 def _sync_positions_state() -> None:
     global _last_synced_slot_count
     token: str | None = None
@@ -2934,6 +2975,7 @@ def get_scheduler_status() -> dict[str, Any]:
     out["boot_scan_status"] = boot_status
     out["scan_active"] = _scan_active
     out["ws_ready"] = _realtime_ws_ready()
+    out["ws_health"] = _ws_health_snapshot()
     return out
 
 

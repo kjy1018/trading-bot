@@ -26,6 +26,7 @@ WS_FAILBACK_POLL_SEC = 5.0  # WS 미사용/끊김 시 REST 폴백 주기
 WS_WATCHLIST_TOP_N = 20  # 빈 슬롯 시 WS 구독할 유니버스 상위 N
 WS_SCAN_DEBOUNCE_SEC = 0.8  # WS 틱 기반 재탐색 최소 간격
 WS_ENGINE_WAIT_SEC = 0.05  # WS 연결 시 엔진 대기(이벤트 깨우기)
+WS_HEARTBEAT_TIMEOUT_SEC = float(os.environ.get("WS_HEARTBEAT_TIMEOUT_SEC", "5"))
 
 # 멀티 슬롯 · 총 시드 (고정 종목당 150만 원 폐지 → 가변 베팅)
 MAX_SIMULTANEOUS_STOCKS = 5
