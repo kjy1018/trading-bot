@@ -179,6 +179,7 @@ _stats_date: date | None = None
 _last_position_persist: float = 0.0
 _POSITION_PERSIST_INTERVAL = 2.0
 _last_synced_slot_count: int = -1
+_last_loaded_positions_mtime: float = -1.0
 
 _emergency_lock = threading.Lock()
 _start_lock = threading.Lock()
@@ -569,6 +570,7 @@ def _refresh_account_snapshot(force: bool = False) -> dict[str, Any]:
     with _state_lock:
         _state["account_snapshot"] = snap
     _last_account_refresh_at = now
+    reload_positions_if_disk_changed()
     return snap
 
 
@@ -1013,6 +1015,18 @@ def _load_positions_from_disk() -> None:
     _sync_positions_state()
     if persisted:
         logger.info("보유 포지션 복구: %d종목 %s", len(persisted), list(persisted.keys()))
+    global _last_loaded_positions_mtime
+    _last_loaded_positions_mtime = trade_state.get_positions_file_mtime()
+
+
+def reload_positions_if_disk_changed() -> bool:
+    """positions_state.json mtime 변경 시 메모리 포지션 재로드."""
+    global _last_loaded_positions_mtime
+    mtime = trade_state.get_positions_file_mtime()
+    if mtime == _last_loaded_positions_mtime:
+        return False
+    _load_positions_from_disk()
+    return True
 
 
 def _backfill_missing_atr_stop(code: str, pos: dict[str, Any]) -> None:

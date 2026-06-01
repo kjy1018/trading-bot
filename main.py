@@ -10,7 +10,6 @@ from datetime import datetime, timedelta
 from html import escape
 from typing import Any
 
-import requests
 import streamlit as st
 
 import config
@@ -41,9 +40,9 @@ from trading_logic import (
 from trade_state import (
     ensure_trade_state_file,
     get_daily_signature,
+    get_positions_file_mtime,
     get_weekly_signature,
 )
-from account import KISApiError
 from scheduler import (
     MAX_SLOTS,
     MONITOR_INTERVAL_SEC,
@@ -70,6 +69,7 @@ from scheduler import (
     get_watch_time_snapshot,
     manual_buy_recommended_pick,
     preview_manual_pick_entry,
+    reload_positions_if_disk_changed,
     start_background_scheduler,
     update_position_trading_mode,
 )
@@ -118,6 +118,63 @@ def _clear_commander_metrics_cache() -> None:
         st.session_state.pop(key, None)
 
 
+def _clear_positions_session_cache() -> None:
+    for key in (
+        "positions_display",
+        "positions_last_ok_at",
+        "positions_cache_stale",
+    ):
+        st.session_state.pop(key, None)
+
+
+def _ui_scheduler_signature() -> tuple[Any, ...]:
+    """스케줄러·계좌 스냅샷 변경 감지 — 세션 캐시 무효화용."""
+    status = get_scheduler_status()
+    positions = get_positions_snapshot()
+    account = get_account_ui_snapshot()
+    pos_codes = tuple(
+        sorted(
+            code
+            for code in (
+                normalize_code(p.get("code")) for p in positions if isinstance(p, dict)
+            )
+            if len(code) == 6
+        )
+    )
+    holdings = account.get("holdings") or {}
+    acct_codes: tuple[str, ...] = ()
+    if isinstance(holdings, dict):
+        acct_codes = tuple(sorted(str(k) for k in holdings.keys() if str(k).isdigit()))
+    return (
+        int(status.get("slot_count", 0)),
+        pos_codes,
+        str(account.get("updated_at") or ""),
+        acct_codes,
+        int(account.get("stock_eval") or account.get("total_eval") or 0),
+        int(account.get("cash") or 0),
+        float(get_positions_file_mtime()),
+    )
+
+
+def _sync_ui_snapshots_from_scheduler(*, trigger_rerun: bool = False) -> bool:
+    """account/positions 스냅샷 시그니처 변경 시 UI 세션 캐시를 버리고 필요하면 rerun."""
+    if reload_positions_if_disk_changed():
+        _clear_positions_session_cache()
+        _clear_commander_metrics_cache()
+    sig = _ui_scheduler_signature()
+    prev = st.session_state.get("ui_scheduler_sig")
+    if prev == sig:
+        return False
+    st.session_state["ui_scheduler_sig"] = sig
+    _clear_positions_session_cache()
+    _clear_commander_metrics_cache()
+    st.session_state.pop("account_cache", None)
+    st.session_state.pop("account_cache_stale", None)
+    if trigger_rerun and prev is not None:
+        st.rerun()
+    return True
+
+
 def _apply_boot_scan_result(result: dict[str, Any]) -> None:
     _clear_commander_metrics_cache()
     ts = (
@@ -163,18 +220,17 @@ def _sync_boot_scan_to_session() -> None:
         return
     if narr and "대기" not in narr:
         st.session_state["immediate_boot_scan_done"] = True
-def _get_cached_account_summary(token: str) -> tuple[int, int]:
+def _read_account_panel_values() -> tuple[int, int, int, bool, str | None]:
+    """스케줄러 account_snapshot만 사용 — Streamlit 세션 TTL 캐시 없음."""
     snap = get_account_ui_snapshot()
-    total_eval = int(snap.get("total_eval") or 0)
+    stock_eval = int(snap.get("stock_eval") or snap.get("total_eval") or 0)
     cash = int(snap.get("cash") or 0)
-    st.session_state["account_cache"] = {
-        "token": token,
-        "ts": time.time(),
-        "total_eval": total_eval,
-        "cash": cash,
-    }
-    st.session_state["account_cache_stale"] = bool(snap.get("stale", False))
-    return total_eval, cash
+    account_total = int(snap.get("account_total_eval") or (stock_eval + cash))
+    stale = bool(snap.get("stale", False))
+    updated_at = snap.get("updated_at")
+    return stock_eval, cash, account_total, stale, (
+        str(updated_at) if updated_at else None
+    )
 
 
 def _enrich_slot_position(pos: dict[str, Any], token: str | None) -> dict[str, Any]:
@@ -200,50 +256,45 @@ def _positions_cache_snapshot() -> list[dict[str, Any]]:
     return [dict(p) for p in cached if isinstance(p, dict)]
 
 
-def _store_stable_positions(positions: list[dict[str, Any]]) -> None:
+def _store_stable_positions(
+    positions: list[dict[str, Any]],
+    *,
+    slot_count: int | None = None,
+) -> None:
     if not positions:
+        if slot_count is not None and slot_count <= 0:
+            st.session_state["positions_display"] = []
+            st.session_state["positions_last_ok_at"] = time.time()
         return
     st.session_state["positions_display"] = [dict(p) for p in positions]
     st.session_state["positions_last_ok_at"] = time.time()
 
 
-def _merge_positions_with_cache(
-    fresh: list[dict[str, Any]],
-    cached: list[dict[str, Any]],
-    token: str | None,
-) -> list[dict[str, Any]]:
-    if not cached:
-        return [_enrich_slot_position(p, token) for p in fresh]
-    cached_by_code = {
-        normalize_code(p.get("code")): dict(p)
-        for p in cached
-        if normalize_code(p.get("code"))
-    }
-    merged: list[dict[str, Any]] = []
-    for pos in fresh:
-        code = normalize_code(pos.get("code"))
-        base = cached_by_code.get(code, {})
-        merged.append(_enrich_slot_position({**base, **pos}, token))
-    return merged
-
-
 def _positions_for_display() -> list[dict[str, Any]]:
+    _sync_ui_snapshots_from_scheduler(trigger_rerun=False)
+    reload_positions_if_disk_changed()
     snap = get_positions_snapshot()
     token = st.session_state.get("access_token")
-    cached = _positions_cache_snapshot()
     status = get_scheduler_status()
-    fresh = [_enrich_slot_position(p, token) for p in snap] if snap else []
-    if fresh:
-        merged = _merge_positions_with_cache(fresh, cached, token)
-        _store_stable_positions(merged)
+    slot_count = int(status.get("slot_count", 0))
+    if snap:
+        enriched = [_enrich_slot_position(p, token) for p in snap]
+        _store_stable_positions(enriched, slot_count=slot_count)
         st.session_state["positions_cache_stale"] = False
-        return merged
-    if cached:
-        last_ok = float(st.session_state.get("positions_last_ok_at", 0.0) or 0.0)
-        within_grace = time.time() - last_ok <= UI_SLOT_CACHE_GRACE_SEC
-        if int(status.get("slot_count", 0)) > 0 or within_grace:
-            st.session_state["positions_cache_stale"] = True
-            return [_enrich_slot_position(p, token) for p in cached]
+        return enriched
+    if slot_count <= 0:
+        _store_stable_positions([], slot_count=0)
+        st.session_state["positions_cache_stale"] = False
+        return []
+    cached = _positions_cache_snapshot()
+    last_ok = float(st.session_state.get("positions_last_ok_at", 0.0) or 0.0)
+    grace_sec = min(3.0, UI_SLOT_CACHE_GRACE_SEC)
+    within_grace = cached and (time.time() - last_ok <= grace_sec)
+    if within_grace and len(cached) == slot_count:
+        st.session_state["positions_cache_stale"] = True
+        return [_enrich_slot_position(p, token) for p in cached]
+    if cached and len(cached) != slot_count:
+        _clear_positions_session_cache()
     st.session_state["positions_cache_stale"] = False
     return []
 
@@ -553,12 +604,13 @@ def _warm_ui_session_caches() -> None:
             )
     selected_modes.save_modes(book)
     if snap:
-        _store_stable_positions([_enrich_slot_position(p, token) for p in snap])
+        status = get_scheduler_status()
+        _store_stable_positions(
+            [_enrich_slot_position(p, token) for p in snap],
+            slot_count=int(status.get("slot_count", len(snap))),
+        )
     trade_state.ensure_trade_state_file()
-    if st.session_state.get("access_token"):
-        cache = st.session_state.setdefault("account_cache", {})
-        if not cache.get("total_eval") and not cache.get("cash"):
-            cache.pop("ts", None)
+    _sync_ui_snapshots_from_scheduler(trigger_rerun=False)
 
 
 def _sync_force_scan_to_session() -> None:
@@ -992,8 +1044,8 @@ def _get_commander_metrics_cached(
     )
     daily_sig = get_daily_signature()
     week_sig = get_weekly_signature()
-    tick = int(time.time()) // max(1, COMMANDER_PNL_REFRESH_SEC)
-    cache_key = (pos_sig, slot_sig, daily_sig, week_sig, tick)
+    acct_updated = str((get_account_ui_snapshot() or {}).get("updated_at") or "")
+    cache_key = (pos_sig, slot_sig, daily_sig, week_sig, acct_updated)
     if (
         not force_refresh
         and st.session_state.get("commander_metrics_sig") == cache_key
@@ -1298,6 +1350,35 @@ def _render_slots_grid(positions: list[dict[str, Any]], max_slots: int) -> None:
 
 
 @st.fragment(run_every=timedelta(seconds=3))
+def _ui_snapshot_watchdog() -> None:
+    """잔고·positions_state.json 변경 시 세션 캐시 무시 후 st.rerun()으로 전체 새로고침."""
+    file_mtime = float(get_positions_file_mtime())
+    prev_mtime = float(st.session_state.get("ui_positions_file_mtime") or 0.0)
+    account_updated = str((get_account_ui_snapshot() or {}).get("updated_at") or "")
+    prev_account_updated = str(st.session_state.get("ui_account_updated_at") or "")
+
+    if reload_positions_if_disk_changed():
+        _clear_positions_session_cache()
+        _clear_commander_metrics_cache()
+
+    st.session_state["ui_positions_file_mtime"] = file_mtime
+    st.session_state["ui_account_updated_at"] = account_updated
+
+    if prev_mtime and file_mtime > prev_mtime:
+        _clear_positions_session_cache()
+        _clear_commander_metrics_cache()
+        st.rerun()
+        return
+    if prev_account_updated and account_updated and account_updated != prev_account_updated:
+        _clear_positions_session_cache()
+        _clear_commander_metrics_cache()
+        st.rerun()
+        return
+
+    _sync_ui_snapshots_from_scheduler(trigger_rerun=True)
+
+
+@st.fragment(run_every=timedelta(seconds=3))
 def _hero_balance_panel() -> None:
     positions = _positions_for_display()
     snap = _build_live_balance_snapshot(positions)
@@ -1447,26 +1528,27 @@ def _slots_panel() -> None:
         )
 
 
-@st.fragment(run_every=timedelta(seconds=60))
+@st.fragment(run_every=timedelta(seconds=min(ACCOUNT_REFRESH_SEC, COMMANDER_PNL_REFRESH_SEC)))
 def _account_panel(token: str | None) -> None:
-    cache = st.session_state.get("account_cache", {})
-    if token:
-        try:
-            total_eval, cash = _get_cached_account_summary(token)
-        except (KISApiError, requests.HTTPError):
-            total_eval, cash = cache.get("total_eval", 0), cache.get("cash", 0)
-            st.session_state["account_cache_stale"] = True
-    else:
-        total_eval, cash = cache.get("total_eval", 0), cache.get("cash", 0)
-        st.session_state["account_cache_stale"] = True
+    _sync_ui_snapshots_from_scheduler(trigger_rerun=False)
+    stock_eval, cash, account_total, stale, updated_at = _read_account_panel_values()
     st.markdown("### 모의투자 계좌 현황")
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     with c1:
-        st.metric("총 평가금액", f"{int(total_eval):,}원")
+        st.metric("주식 평가금액", f"{stock_eval:,}원")
     with c2:
-        st.metric("보유 현금", f"{int(cash):,}원")
-    if st.session_state.get("account_cache_stale"):
-        st.caption("증권사 응답 대기 중입니다. 직전 정상 계좌 데이터를 유지합니다.")
+        st.metric("예수금", f"{cash:,}원")
+    with c3:
+        st.metric("계좌 총자산", f"{account_total:,}원")
+    if not token:
+        st.caption("접속 토큰 없음 — 스케줄러 스냅샷만 표시합니다.")
+    elif stale:
+        st.caption("증권사 응답 대기 중입니다. 스케줄러가 보관 중인 최신 스냅샷을 표시합니다.")
+    if updated_at:
+        st.caption(
+            f"잔고 스냅샷 · {updated_at} · "
+            f"{min(ACCOUNT_REFRESH_SEC, COMMANDER_PNL_REFRESH_SEC)}초 주기 갱신"
+        )
 
 
 def _render_section_safely(
@@ -1520,6 +1602,7 @@ _handle_browser_refresh_force_scan()
 cached_token = st.session_state.get("access_token")
 token = str(cached_token) if cached_token else None
 
+_ui_snapshot_watchdog()
 _render_section_safely("실시간 잔고 전광판", _hero_balance_panel)
 _render_section_safely("지휘관 실시간 수익률", _commander_pnl_live_panel)
 _render_section_safely("상단 현황판", _header_panel, divider_after=True)

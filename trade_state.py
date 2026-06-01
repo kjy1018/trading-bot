@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -16,6 +17,17 @@ TRADE_STATE_FILE = PROJECT_DIR / "trade_state.json"
 POSITIONS_STATE_FILE = PROJECT_DIR / "positions_state.json"
 
 _lock = threading.RLock()
+_positions_file_cache: dict[str, Any] = {"mtime": None, "data": None}
+
+
+def _flush_filesystem_cache() -> None:
+    """다른 프로세스/스레드가 쓴 직후 디스크 내용을 다시 읽기 위한 힌트."""
+    sync = getattr(os, "sync", None)
+    if callable(sync):
+        try:
+            sync()
+        except OSError:
+            pass
 
 
 def _monday_of(day: date | None = None) -> date:
@@ -50,18 +62,79 @@ def _default_positions_file() -> dict[str, Any]:
 
 def _save_json(path: Path, data: dict[str, Any]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    tmp.write_text(payload, encoding="utf-8")
     tmp.replace(path)
+    if path is POSITIONS_STATE_FILE:
+        _invalidate_positions_file_cache()
+
+
+def _invalidate_positions_file_cache() -> None:
+    _positions_file_cache["mtime"] = None
+    _positions_file_cache["data"] = None
+
+
+def get_positions_file_mtime() -> float:
+    """positions_state.json 수정 시각 — UI·스케줄러 재로드 트리거."""
+    if not POSITIONS_STATE_FILE.is_file():
+        return 0.0
+    try:
+        return float(POSITIONS_STATE_FILE.stat().st_mtime)
+    except OSError:
+        return 0.0
 
 
 def _load_json(path: Path) -> dict[str, Any]:
+    if path is POSITIONS_STATE_FILE:
+        return _load_positions_json_fresh(force=True)
     if not path.is_file():
         return {}
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        _flush_filesystem_cache()
+        with path.open("r", encoding="utf-8") as handle:
+            raw = json.load(handle)
         return raw if isinstance(raw, dict) else {}
     except (json.JSONDecodeError, OSError, TypeError):
         return {}
+
+
+def _load_positions_json_fresh(*, force: bool = False) -> dict[str, Any]:
+    """mtime 변경 시에만 positions_state.json 재파싱."""
+    if not POSITIONS_STATE_FILE.is_file():
+        data = _default_positions_file()
+        _positions_file_cache["mtime"] = 0.0
+        _positions_file_cache["data"] = data
+        return dict(data)
+
+    _flush_filesystem_cache()
+    try:
+        mtime = float(POSITIONS_STATE_FILE.stat().st_mtime)
+    except OSError:
+        return _default_positions_file()
+
+    cached_mtime = _positions_file_cache.get("mtime")
+    cached_data = _positions_file_cache.get("data")
+    if (
+        not force
+        and cached_mtime == mtime
+        and isinstance(cached_data, dict)
+    ):
+        return dict(cached_data)
+
+    try:
+        with POSITIONS_STATE_FILE.open("r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (json.JSONDecodeError, OSError, TypeError):
+        data = _default_positions_file()
+    else:
+        data = raw if isinstance(raw, dict) else _default_positions_file()
+
+    if "positions" not in data or not isinstance(data.get("positions"), dict):
+        data = _default_positions_file()
+
+    _positions_file_cache["mtime"] = mtime
+    _positions_file_cache["data"] = data
+    return dict(data)
 
 
 def _normalize_daily_data(data: dict[str, Any]) -> dict[str, Any]:
@@ -170,15 +243,17 @@ def ensure_positions_file() -> dict[str, Any]:
             data = _default_positions_file()
             _save_json(POSITIONS_STATE_FILE, data)
             return data
-        data = _load_json(POSITIONS_STATE_FILE)
+        data = _load_positions_json_fresh(force=False)
         if "positions" not in data or not isinstance(data["positions"], dict):
             data = _default_positions_file()
             _save_json(POSITIONS_STATE_FILE, data)
         return data
 
 
-def load_persisted_positions() -> dict[str, dict[str, Any]]:
+def load_persisted_positions(*, force_reload: bool = False) -> dict[str, dict[str, Any]]:
     with _lock:
+        if force_reload:
+            _invalidate_positions_file_cache()
         data = ensure_positions_file()
         return {k: dict(v) for k, v in data.get("positions", {}).items()}
 
@@ -186,6 +261,59 @@ def load_persisted_positions() -> dict[str, dict[str, Any]]:
 def save_persisted_positions(positions: dict[str, dict[str, Any]]) -> None:
     with _lock:
         _save_json(POSITIONS_STATE_FILE, {"positions": positions})
+
+
+def sync_positions_file_from_broker_holdings(
+    holdings: dict[str, dict[str, Any]],
+) -> int:
+    """
+    KIS 잔고 holdings 기준으로 positions_state.json 전체 덮어쓰기.
+    증권사에 없는 종목은 파일·메모리에서 제거, 보유 종목은 수량·시세 반영.
+    """
+    with _lock:
+        _invalidate_positions_file_cache()
+        existing = load_persisted_positions(force_reload=True)
+        synced: dict[str, dict[str, Any]] = {}
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        for raw_code, holding in (holdings or {}).items():
+            if not isinstance(holding, dict):
+                continue
+            code = str(raw_code or holding.get("code") or "").strip()
+            code = "".join(ch for ch in code if ch.isdigit())[-6:]
+            if len(code) != 6:
+                continue
+            qty = int(holding.get("quantity") or 0)
+            if qty <= 0:
+                continue
+
+            prev = dict(existing.get(code) or {})
+            current_price = int(
+                holding.get("current_price") or prev.get("current_price") or 0
+            )
+            avg_price = int(holding.get("avg_price") or 0)
+            entry_price = avg_price or int(prev.get("entry_price") or current_price or 0)
+            name = str(holding.get("name") or prev.get("name") or code).strip()
+
+            pos = dict(prev)
+            pos.update(
+                {
+                    "code": code,
+                    "name": name,
+                    "quantity": qty,
+                    "current_price": current_price,
+                    "entry_price": entry_price,
+                    "updated_at": now_text,
+                    "display_name": prev.get("display_name")
+                    or (f"{name} ({code})" if name != code else code),
+                }
+            )
+            if current_price > 0 and entry_price > 0:
+                pos["profit_pct"] = (current_price - entry_price) / entry_price * 100.0
+            synced[code] = pos
+
+        _save_json(POSITIONS_STATE_FILE, {"positions": synced})
+        return len(synced)
 
 
 def record_completed_trade(
