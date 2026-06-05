@@ -17,6 +17,7 @@ import streamlit as st
 import config
 import selected_modes
 import trade_state
+from account import FIXED_SEED_WON, dashboard_pnl_from_account
 from stock_names import (
     enrich_position,
     format_stock_label,
@@ -37,6 +38,7 @@ _SLOT_NAME_FALLBACK: dict[str, str] = {
 from trading_logic import (
     assemble_commander_slots,
     build_commander_dashboard_metrics,
+    build_position_exit_progress,
     format_slot_identity_line,
 )
 from trade_state import (
@@ -75,9 +77,11 @@ from scheduler import (
     get_ui_universe_recommendations,
     get_watch_time_snapshot,
     manual_buy_recommended_pick,
+    handle_manual_buy,
     preview_manual_pick_entry,
     start_background_scheduler,
     set_slot_personality,
+    apply_dashboard_slot_mode_change,
     update_position_trading_mode,
 )
 
@@ -466,18 +470,29 @@ def _persist_slot_mode(idx: int, label: str, code: str | None = None) -> None:
 
 
 def _commit_trading_mode_change(idx: int, code: str) -> None:
-    """selectbox on_change — 슬롯 실시간 성격 → scheduler 메모리·전술 즉시 반영."""
+    """selectbox on_change — 파일 저장 → positions_state → 엔진 reload_config."""
     widget_key = _mode_widget_key_for_slot(idx)
     label = str(st.session_state.get(widget_key) or _DEFAULT_SLOT_MODE_LABEL)
     if label not in _SLOT_MODE_OPTIONS:
         label = _DEFAULT_SLOT_MODE_LABEL
         st.session_state[widget_key] = label
     norm_code = normalize_code(code)
-    _persist_slot_mode(idx, label, norm_code or None)
-    result = set_slot_personality(idx, label)
+    result = apply_dashboard_slot_mode_change(idx, label, norm_code)
     if result.get("success"):
+        _clear_positions_session_cache()
+        _mirror_runtime_state_to_session(force=True)
+        held = result.get("held_code")
+        tgt_pct = None
+        if held:
+            for pos in _session_positions_snapshot():
+                if normalize_code(pos.get("code")) == normalize_code(held):
+                    tgt_pct = pos.get("target_profit_pct")
+                    break
+        extra = ""
+        if tgt_pct is not None:
+            extra = f" · 목표 +{float(tgt_pct):.2f}% 재산출"
         st.session_state["slot_action_notice"] = (
-            f"✅ {result.get('message', f'슬롯 {idx} 모드 변경')}"
+            f"✅ {result.get('message', f'슬롯 {idx} 모드 변경')}{extra}"
         )
         _clear_commander_metrics_cache()
     else:
@@ -578,8 +593,10 @@ def _render_slot_mode_selector(
         args=(idx, code),
     )
     label = str(selected)
-    _persist_slot_mode(idx, label, code or None)
-    st.caption("장중 실시간 변경 · 재시작 없이 봇 전략 즉시 반영")
+    st.caption(
+        "장중 실시간 변경 · selected_modes.json + positions_state.json 저장 · "
+        "봇 엔진 즉시 재로딩"
+    )
     return label
 
 
@@ -710,33 +727,48 @@ def _safe_slot_candidate(candidate: dict[str, Any] | None) -> dict[str, Any] | N
 
 
 def _build_live_balance_snapshot(positions: list[dict[str, Any]]) -> dict[str, Any]:
-    total_cost = 0
-    total_eval = 0
+    """
+    전광판 3칸 — 단일 공식만:
+    total_assets = 예수금 + 주식평가
+    profit_loss = total_assets - 10_000_000
+    return_rate = (profit_loss / 10_000_000) * 100
+    """
+    pnl = dashboard_pnl_from_account(_session_account_snapshot())
+    total_assets = int(pnl["total_assets"])
+    profit_loss = int(pnl["profit_loss"])
+    return_rate = float(pnl["return_rate"])
+    cash = int(pnl["current_deposit"])
+    stock_eval = int(pnl["current_stock_valuation"])
+
     summary_parts: list[str] = []
     for pos in positions[:MAX_SLOTS_DISPLAY]:
         qty = int(pos.get("quantity") or 0)
-        entry = int(pos.get("entry_price") or 0)
-        current = int(pos.get("current_price") or entry or 0)
-        total_cost += entry * qty
-        total_eval += current * qty
         if qty > 0:
             summary_parts.append(f"{_slot_title_label(pos)} {qty}주")
 
-    pnl = total_eval - total_cost
-    pct = pnl / total_cost * 100.0 if total_cost > 0 else 0.0
-    if pnl > 0:
+    if profit_loss > 0:
         theme = "plus"
-    elif pnl < 0:
+    elif profit_loss < 0:
         theme = "minus"
     else:
         theme = "flat"
+
+    foot = (
+        f"예수금 {cash:,}원 + 주식 {stock_eval:,}원 = 총자산 {total_assets:,}원 · "
+        f"손익 {profit_loss:+,}원 · 수익률 {return_rate:+.2f}% "
+        f"(원금 {FIXED_SEED_WON:,}원)"
+    )
+    if summary_parts:
+        foot += " · " + " · ".join(summary_parts)
+
     return {
-        "total_cost": total_cost,
-        "total_eval": total_eval,
-        "total_pnl": pnl,
-        "total_pct": pct,
+        "cash": cash,
+        "stock_eval": stock_eval,
+        "total_assets": total_assets,
+        "profit_loss": profit_loss,
+        "return_rate": return_rate,
         "theme": theme,
-        "summary": " · ".join(summary_parts) if summary_parts else "보유 종목 없음",
+        "summary": foot,
     }
 
 
@@ -988,6 +1020,44 @@ st.markdown(
     }
     .target-exit-line .target-remain {
         color: #f57f17; font-weight: 600; font-size: 0.8rem;
+    }
+    .hero-holdings-exit {
+        margin-top: 0.65rem; padding-top: 0.55rem;
+        border-top: 1px dashed rgba(255,255,255,0.25);
+    }
+    .hero-holding-exit {
+        margin: 0.45rem 0 0.55rem 0; text-align: left;
+    }
+    .hero-holding-exit-head {
+        display: flex; justify-content: space-between; align-items: baseline;
+        font-size: 0.82rem; margin-bottom: 0.25rem; gap: 0.5rem;
+    }
+    .hero-holding-exit-name { font-weight: 700; color: #fffde7; }
+    .hero-holding-exit-pnl.plus { color: #69f0ae; font-weight: 800; }
+    .hero-holding-exit-pnl.minus { color: #ff8a80; font-weight: 800; }
+    .hero-holding-exit-pnl.flat { color: #e0e0e0; font-weight: 700; }
+    .hero-exit-track {
+        position: relative; height: 10px; border-radius: 5px;
+        background: rgba(0,0,0,0.35); overflow: visible; margin: 0.35rem 0 0.2rem 0;
+    }
+    .hero-exit-fill {
+        position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px;
+        background: linear-gradient(90deg, #546e7a, #81c784);
+        max-width: 100%;
+    }
+    .hero-exit-marker {
+        position: absolute; top: -3px; width: 3px; height: 16px; border-radius: 2px;
+        transform: translateX(-50%);
+    }
+    .hero-exit-marker.current { background: #fff; box-shadow: 0 0 4px #fff; z-index: 3; }
+    .hero-exit-marker.stop { background: #ef5350; z-index: 2; }
+    .hero-exit-marker.target { background: #ffd54f; z-index: 2; }
+    .hero-exit-labels {
+        display: flex; justify-content: space-between; font-size: 0.72rem;
+        color: rgba(255,255,255,0.85); line-height: 1.3;
+    }
+    .hero-exit-caption {
+        font-size: 0.72rem; color: rgba(255,255,255,0.78); margin-top: 0.15rem;
     }
     .commander-pnl-board {
         padding: 0.85rem 1.1rem; margin: 0.5rem 0 0.65rem 0;
@@ -1288,6 +1358,92 @@ def _render_commander_pnl_board(positions: list[dict[str, Any]]) -> None:
     )
 
 
+def _pnl_mini_class(pct: float) -> str:
+    if pct > 0:
+        return "plus"
+    if pct < 0:
+        return "minus"
+    return "flat"
+
+
+def _format_exit_progress_html(prog: dict[str, Any], *, title: str = "") -> str:
+    """목표·손절 대비 현재 수익률 — 슬롯·전광판 공통."""
+    if not prog.get("has_position"):
+        return ""
+    profit = float(prog["profit_pct"])
+    tgt = float(prog["target_profit_pct"])
+    stop = prog.get("stop_loss_pct")
+    rem_tgt = float(prog["remaining_to_target_pct"])
+    rem_stop = prog.get("remaining_to_stop_pct")
+    kind = str(prog.get("target_kind") or "limit")
+    fill = float(prog["bar_fill_pct"])
+    cur_m = float(prog["bar_current_pct"])
+    stop_m = float(prog["bar_stop_pct"])
+    tgt_m = float(prog["bar_target_pct"])
+
+    stop_txt = f"손절 {stop:+.2f}%" if stop is not None else "손절 —"
+    tgt_label = "목표(상한)" if kind == "trailing" else "목표"
+    tgt_txt = f"{tgt_label} +{tgt:.2f}%"
+
+    if rem_tgt > 0.05:
+        cap_tgt = f"목표까지 <span class='target-remain'>+{rem_tgt:.2f}%p</span>"
+    elif profit >= tgt:
+        cap_tgt = "<span class='target-remain'>목표 구간 도달</span>"
+    else:
+        cap_tgt = f"<span class='target-remain'>목표 +{tgt:.2f}%</span>"
+
+    if rem_stop is not None:
+        if rem_stop > 0.05:
+            cap_stop = f" · 손절까지 {rem_stop:.2f}%p"
+        else:
+            cap_stop = " · <span style='color:#ef5350'>손절 구간</span>"
+    else:
+        sl_px = int(prog.get("stop_loss_price") or 0)
+        cap_stop = f" · 손절가 {sl_px:,}원" if sl_px > 0 else ""
+
+    note = str(prog.get("target_note") or "").strip()
+    note_html = f"<br><span style='font-size:0.7rem;opacity:0.85'>{escape(note)}</span>" if note else ""
+
+    head = ""
+    if title.strip():
+        head = (
+            f'<div class="hero-holding-exit-head">'
+            f'<span class="hero-holding-exit-name">{escape(title)}</span>'
+            f'<span class="hero-holding-exit-pnl {_pnl_mini_class(profit)}">'
+            f"{profit:+.2f}%</span></div>"
+        )
+
+    return (
+        f'<div class="hero-holding-exit">'
+        f"{head}"
+        f'<div class="hero-exit-track">'
+        f'<div class="hero-exit-fill" style="width:{fill:.1f}%"></div>'
+        f'<span class="hero-exit-marker stop" style="left:{stop_m:.1f}%"></span>'
+        f'<span class="hero-exit-marker target" style="left:{tgt_m:.1f}%"></span>'
+        f'<span class="hero-exit-marker current" style="left:{cur_m:.1f}%"></span>'
+        f"</div>"
+        f'<div class="hero-exit-labels">'
+        f"<span>{stop_txt}</span><span>{tgt_txt}</span>"
+        f"</div>"
+        f'<div class="hero-exit-caption">{cap_tgt}{cap_stop}{note_html}</div>'
+        f"</div>"
+    )
+
+
+def _render_holdings_exit_progress_block(positions: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for pos in positions:
+        if int(pos.get("quantity") or 0) <= 0:
+            continue
+        prog = build_position_exit_progress(pos)
+        if not prog.get("has_position"):
+            continue
+        parts.append(_format_exit_progress_html(prog, title=_slot_title_label(pos)))
+    if not parts:
+        return ""
+    return '<div class="hero-holdings-exit">' + "".join(parts) + "</div>"
+
+
 def _slot_progress_hint(pos: dict[str, Any]) -> str:
     kind = str(pos.get("target_kind") or "limit")
     if kind == "trailing":
@@ -1397,7 +1553,7 @@ def _render_empty_control_slot(
         if st.button(
             "🔄 다른 종목 추천",
             key=f"slot_rotate_{idx}",
-            use_container_width=True,
+            width="stretch",
         ):
             if candidate:
                 cache = st.session_state.get("slot_buy_preview_cache")
@@ -1419,27 +1575,36 @@ def _render_empty_control_slot(
             "🛒 이 종목 매수",
             key=f"slot_buy_{idx}",
             disabled=not can_buy,
-            use_container_width=True,
+            width="stretch",
             type="primary",
         ):
             with st.spinner("추천 종목 매수 주문 접수 중..."):
                 try:
-                    result = manual_buy_recommended_pick(
+                    result = handle_manual_buy(
                         selected_candidate or candidate or {},
                         slot_idx=idx,
                     )
                 except Exception:
                     result = {"success": False, "message": "주문 처리 대기 중입니다. 잠시 후 다시 시도해 주세요."}
             if result.get("success"):
+                from portfolio_manager import flush_portfolio_state_for_ui
+
+                flush_portfolio_state_for_ui(reason=f"ui_manual_buy_slot_{idx}")
                 st.session_state["slot_action_notice"] = (
                     f"✅ 슬롯 {idx} {selected_mode_label} 모드 주문 접수: {result.get('message', '')}"
                 )
                 _clear_commander_metrics_cache()
                 st.rerun()
-            st.session_state["slot_action_notice"] = (
-                f"⚠️ 슬롯 {idx} {selected_mode_label} 모드 진입 실패: {result.get('message', '주문 실패')}"
-            )
-            st.rerun()
+            else:
+                st.session_state["slot_action_notice"] = (
+                    f"⚠️ 슬롯 {idx} {selected_mode_label} 모드 진입 실패: {result.get('message', '주문 실패')}"
+                    + (
+                        f" · 차단={','.join(result.get('failed_steps') or [])}"
+                        if result.get("failed_steps")
+                        else ""
+                    )
+                )
+                st.rerun()
 
 
 def _render_slot(pos: dict[str, Any] | None, idx: int, positions: list[dict[str, Any]]) -> None:
@@ -1463,6 +1628,12 @@ def _render_slot(pos: dict[str, Any] | None, idx: int, positions: list[dict[str,
         with c2:
             st.metric("현재가", f"{pos.get('current_price', 0):,}원")
         _render_profit_banner(float(pos.get("profit_pct", 0)))
+        exit_html = _format_exit_progress_html(build_position_exit_progress(pos))
+        if exit_html:
+            st.markdown(
+                f'<div class="target-exit-line">{exit_html}</div>',
+                unsafe_allow_html=True,
+            )
         trail = ""
         if pos.get("trailing_active"):
             trail = (
@@ -1484,7 +1655,7 @@ def _render_slot(pos: dict[str, Any] | None, idx: int, positions: list[dict[str,
             "🔒 매수 락",
             key=f"slot_lock_{idx}",
             disabled=True,
-            use_container_width=True,
+            width="stretch",
         )
     else:
         controls = _sync_slot_controls(positions, _session_slot_layout())
@@ -1511,6 +1682,12 @@ def _render_uncategorized_holding(pos: dict[str, Any]) -> None:
     with c3:
         st.metric("현재가", f"{int(pos.get('current_price') or 0):,}원")
     _render_profit_banner(float(pos.get("profit_pct", 0)))
+    exit_html = _format_exit_progress_html(build_position_exit_progress(pos))
+    if exit_html:
+        st.markdown(
+            f'<div class="target-exit-line">{exit_html}</div>',
+            unsafe_allow_html=True,
+        )
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -1659,17 +1836,22 @@ def _ui_snapshot_watchdog() -> None:
 def _hero_balance_panel() -> None:
     positions = _positions_for_display()
     snap = _build_live_balance_snapshot(positions)
+    holdings_exit = _render_holdings_exit_progress_block(positions)
     st.markdown(
         f'<div class="hero-balance-board {snap["theme"]}">'
         f'<div class="hero-balance-head">실시간 잔고 전광판 · 보유 종목 자동 합산</div>'
         f'<div class="hero-balance-grid">'
-        f'<div class="hero-balance-card"><div class="hero-balance-card-label">총 평가금액</div>'
-        f'<div class="hero-balance-card-value">{int(snap["total_eval"]):,}원</div></div>'
-        f'<div class="hero-balance-card"><div class="hero-balance-card-label">실시간 총 평가손익</div>'
-        f'<div class="hero-balance-card-value">{int(snap["total_pnl"]):+,}원</div></div>'
-        f'<div class="hero-balance-card"><div class="hero-balance-card-label">총 수익률</div>'
-        f'<div class="hero-balance-card-value">{float(snap["total_pct"]):+.2f}%</div></div>'
+        f'<div class="hero-balance-card"><div class="hero-balance-card-label">전체 자산</div>'
+        f'<div class="hero-balance-card-value">{int(snap["total_assets"]):,}원</div></div>'
+        f'<div class="hero-balance-card"><div class="hero-balance-card-label">전체 평가손익</div>'
+        f'<div class="hero-balance-card-value">{int(snap["profit_loss"]):+,}원</div></div>'
+        f'<div class="hero-balance-card"><div class="hero-balance-card-label">수익률</div>'
+        f'<div class="hero-balance-card-value">{float(snap["return_rate"]):+.2f}%</div>'
+        f'<div class="hero-balance-card-sub" style="font-size:0.68rem;opacity:0.85;margin-top:0.2rem;">'
+        f"(예수금+주식−1천만)"
+        f"</div></div>"
         f"</div>"
+        f"{holdings_exit}"
         f'<div class="hero-balance-foot">{escape(str(snap["summary"]))}</div>'
         f"</div>",
         unsafe_allow_html=True,
@@ -1770,6 +1952,22 @@ def _header_panel() -> None:
             st.success(boot_toast)
         else:
             st.warning(boot_toast)
+
+    ml_guard = status.get("ml_guard_alert") or {}
+    if ml_guard.get("blocked"):
+        prob_txt = (
+            f" (손절 확률 {ml_guard['prob_pct']:.1f}%)"
+            if ml_guard.get("prob_pct") is not None
+            else ""
+        )
+        name = ml_guard.get("name") or ml_guard.get("code") or "—"
+        code = ml_guard.get("code") or ""
+        st.warning(
+            f"**[AI 가드] 위험 신호 감지: 매수 보류**{prob_txt} — "
+            f"{name}({code})"
+        )
+        if ml_guard.get("detail"):
+            st.caption(str(ml_guard.get("detail")))
 
     if status.get("running"):
         _render_top_status_banner()
@@ -1933,7 +2131,7 @@ def _receipts_panel() -> None:
             }
             for e in history
         ],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
     total = int(stats.get("total_pnl", 0))
@@ -1979,7 +2177,7 @@ def _performance_charts_panel() -> None:
             df_eq = pd.DataFrame(equity_rows)
             if "날짜" in df_eq.columns:
                 df_eq = df_eq.set_index("날짜")
-            st.line_chart(df_eq, height=300, use_container_width=True)
+            st.line_chart(df_eq, height=300, width="stretch")
             last = equity_rows[-1].get("전체 자산 (원)", 0)
             st.metric("최신 전체 자산", f"{int(last):,}원")
         elif account_total > 0:
@@ -1987,7 +2185,7 @@ def _performance_charts_panel() -> None:
             df_eq = pd.DataFrame(
                 [{"날짜": today, "전체 자산 (원)": account_total}]
             ).set_index("날짜")
-            st.line_chart(df_eq, height=300, use_container_width=True)
+            st.line_chart(df_eq, height=300, width="stretch")
             st.caption("매매·스냅샷 이력이 쌓이면 날짜별 곡선이 확장됩니다.")
         else:
             st.info("계좌 잔고가 연결되면 전체 자산 곡선이 표시됩니다.")
@@ -1998,7 +2196,7 @@ def _performance_charts_panel() -> None:
             df_bar = pd.DataFrame(pnl_rows)
             if "날짜" in df_bar.columns:
                 df_bar = df_bar.set_index("날짜")
-            st.bar_chart(df_bar, height=300, use_container_width=True)
+            st.bar_chart(df_bar, height=300, width="stretch")
             today_pnl = int(pnl_rows[-1].get("실현 손익 (원)", 0))
             st.metric("최근 거래일 실현손익", f"{today_pnl:+,}원")
         else:

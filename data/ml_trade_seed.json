@@ -1,0 +1,17 @@
+[
+  {
+    "trade_id": "seed_041190_loss_add",
+    "stock_name": "우리기술투자",
+    "stock_code": "041190",
+    "buy_time": "2026-06-02 13:47:49",
+    "buy_price": 6071,
+    "sell_time": "2026-06-05 12:31:07",
+    "sell_price": 5670,
+    "pnl": -58245,
+    "profit_pct": -5.86,
+    "exit_type": "손절",
+    "label_stop_loss": 1,
+    "trading_mode": "swing",
+    "note": "피라미딩 매수분 — 동일 손절 라벨"
+  }
+]

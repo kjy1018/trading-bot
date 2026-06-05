@@ -250,6 +250,37 @@ def send_fill_embed(
     )
 
 
+def send_holding_change_embed(
+    *,
+    change_kind: str,
+    code: str,
+    name: str,
+    old_qty: int,
+    new_qty: int,
+    delta_qty: int,
+    detail: str = "",
+) -> None:
+    kind_labels = {
+        "partial_sell": "분할 매도·수량 감소",
+        "sold_out": "전량 매도",
+        "qty_increase": "보유 수량 증가",
+        "new_holding": "신규 보유 동기화",
+    }
+    title = kind_labels.get(change_kind, "보유 변동")
+    color = 0xE74C3C if delta_qty < 0 else 0x1ABC9C
+    _submit_embed(
+        title=f"보유 변동 · {title}",
+        description=f"{name}({code})",
+        color=color,
+        fields=[
+            ("이전", f"{int(old_qty)}주", True),
+            ("현재", f"{int(new_qty)}주", True),
+            ("변화", f"{int(delta_qty):+d}주", True),
+            ("비고", detail or "계좌 동기화 감지", False),
+        ],
+    )
+
+
 def _pnl_embed_color(daily_pnl: int) -> int:
     if daily_pnl > 0:
         return 0xE74C3C
@@ -271,18 +302,14 @@ def _format_signed_pct(value: float) -> str:
 def _compute_cumulative_asset_return_pct(
     total_eval: int,
     cash: int,
-    *,
-    principal: int | None = None,
+    **_: Any,
 ) -> float:
-    """
-    누적 자산 수익률(원금 대비) — KIS 보유종목 수익률 미사용.
-    ((총 평가금액 + 예수금) - 원금) / 원금 * 100
-    """
-    base = int(principal if principal is not None else _PRINCIPAL_WON)
-    if base <= 0:
-        return 0.0
-    total_assets = int(total_eval) + int(cash)
-    return round((total_assets - base) / base * 100.0, 2)
+    """return_rate = ((예수금+주식평가) - 10_000_000) / 10_000_000 * 100."""
+    from account import compute_realized_return_metrics
+
+    return float(
+        compute_realized_return_metrics(int(cash), int(total_eval))["return_rate"]
+    )
 
 
 def _format_daily_summary_description(
@@ -294,7 +321,7 @@ def _format_daily_summary_description(
     return (
         f"📊 **당일 평가손익** `{int(daily_eval_pnl):+,}원` "
         f"(`{_format_signed_pct(daily_eval_pnl_pct)}`)\n"
-        f"💰 **누적 자산 수익률(원금 1천만 대비)** "
+        f"💰 **실현 수익률(원금 1천만 고정)** "
         f"`{_format_signed_pct(cumulative_return_pct)}`"
     )
 
@@ -317,74 +344,73 @@ def make_daily_summary_embed(
     briefing: str = "",
     news_links: list[dict[str, str]] | None = None,
     total_return_pct: float | None = None,
+    settlement_return_pct: float | None = None,
+    total_purchase_amt: int = 0,
+    total_eval_pnl: int = 0,
+    **kwargs: Any,
 ) -> discord.Embed:
-    # API·스냅샷의 total_return_pct는 무시하고, 임베드에서 원금 대비 수익률만 재계산
-    _ = total_return_pct
     stock_eval_amt = int(stock_eval if stock_eval is not None else total_eval)
     cash_amt = int(cash)
-    cumulative_return_pct = _compute_cumulative_asset_return_pct(
-        stock_eval_amt, cash_amt
-    )
-    total_assets = stock_eval_amt + cash_amt
-    seed = int(bot_operating_seed or getattr(config, "ACCOUNT_TOTAL_SEED", 7_500_000))
-    deployed = int(bot_deployed_won)
-    bot_mv = int(bot_market_value_won)
-    seed_note = (
-        f"실투입 {deployed:,}원 / 시드 {seed:,}원"
-        if seed > 0
-        else f"실투입 {deployed:,}원"
-    )
-    if seed > 0 and deployed > 0:
-        use_pct = round(deployed / seed * 100.0, 1)
-        seed_note += f" ({use_pct}%)"
+    from account import compute_realized_return_metrics
 
-    footnote = f"실현손익 {int(realized_pnl):+,}원 · 당일 매매 {int(trade_count)}회"
+    metrics = compute_realized_return_metrics(cash_amt, stock_eval_amt)
+    total_assets = int(
+        kwargs.get("settlement_total_assets") or metrics["total_assets"]
+    )
+    profit_loss = int(
+        kwargs.get("settlement_profit_loss") or metrics["profit_loss"]
+    )
+    if settlement_return_pct is not None:
+        cumulative_return_pct = float(settlement_return_pct)
+    elif total_return_pct is not None:
+        cumulative_return_pct = float(total_return_pct)
+    else:
+        cumulative_return_pct = float(metrics["return_rate"])
+    _ = (
+        total_purchase_amt,
+        total_eval_pnl,
+        bot_operating_seed,
+        bot_deployed_won,
+        bot_market_value_won,
+        kwargs,
+    )
+
+    footnote = f"당일 매매 {int(trade_count)}회 · DB 실현 {int(realized_pnl):+,}원"
     embed = discord.Embed(
-        title=f"{tag} · 계좌 영수증",
-        description=_format_daily_summary_description(
-            daily_eval_pnl=daily_eval_pnl,
-            daily_eval_pnl_pct=daily_eval_pnl_pct,
-            cumulative_return_pct=cumulative_return_pct,
+        title=f"{tag} · 일일 정산",
+        description=(
+            f"💰 **정산 수익률** `{_format_signed_pct(cumulative_return_pct)}`\n"
+            f"(예수금 {cash_amt:,} + 주식 {stock_eval_amt:,} = {total_assets:,}원 · "
+            f"손익 {profit_loss:+,}원 · 원금 10,000,000원)\n\n"
+            f"📊 당일 평가손익 `{int(daily_eval_pnl):+,}원` "
+            f"(`{_format_signed_pct(daily_eval_pnl_pct)}`)"
         ),
-        color=_pnl_embed_color(daily_eval_pnl),
+        color=_pnl_embed_color(profit_loss),
     )
     embed.add_field(
-        name="주식 평가금액 (KIS)",
+        name="주식 평가액",
         value=f"{stock_eval_amt:,}원",
         inline=True,
     )
     embed.add_field(
-        name="예수금 (KIS)",
+        name="예수금",
         value=f"{cash_amt:,}원",
         inline=True,
     )
     embed.add_field(
-        name="합계 (주식+예수금)",
+        name="총자산 (예수금+주식)",
         value=f"{total_assets:,}원",
         inline=True,
     )
     embed.add_field(
-        name="봇 운용 시드 (설정)",
-        value=f"{seed:,}원",
-        inline=True,
-    )
-    embed.add_field(
-        name="슬롯 실투입 (봇)",
-        value=seed_note,
-        inline=True,
-    )
-    embed.add_field(
-        name="슬롯 시가총액 (봇)",
-        value=f"{bot_mv:,}원 · {int(slot_count)}슬롯",
+        name="보유 슬롯",
+        value=f"{int(slot_count)}개",
         inline=True,
     )
     if account_total_eval > 0 and account_total_eval != total_assets:
         embed.add_field(
-            name="참고 · KIS 계좌총평가",
-            value=(
-                f"tot_evlu_amt {account_total_eval:,}원 "
-                f"(계좌 전체·봇 합계와 다를 수 있음)"
-            ),
+            name="참고 · KIS tot_evlu_amt",
+            value=f"{account_total_eval:,}원 (총자산 합계와 별도 필드)",
             inline=False,
         )
     embed.add_field(name="참고", value=footnote, inline=False)
@@ -497,10 +523,27 @@ def make_daily_close_report_embed(report: dict[str, Any]) -> discord.Embed:
 
     strategy = str(report.get("tomorrow_strategy") or "-")[:900]
     ai_tag = " · AI" if report.get("tomorrow_ai") else ""
+    ret = report.get("return_rate")
+    if ret is None:
+        from account import dashboard_pnl_from_account
+
+        acct = report.get("account_snapshot") or {}
+        pnl = dashboard_pnl_from_account(acct if isinstance(acct, dict) else {})
+        ret = float(pnl["return_rate"])
+        pnl_won = int(pnl["profit_loss"])
+        tot = int(pnl["total_assets"])
+    else:
+        ret = float(ret)
+        pnl_won = int(report.get("profit_loss") or 0)
+        tot = int(report.get("total_assets") or 0)
 
     embed = discord.Embed(
         title=f"📋 장 마감 리포트 ({day})",
-        description=f"생성 {report.get('generated_at', '')}{ai_tag}",
+        description=(
+            f"💰 **정산 수익률** `{_format_signed_pct(ret)}` "
+            f"(총자산 {tot:,}원 · 손익 {pnl_won:+,}원)\n"
+            f"생성 {report.get('generated_at', '')}{ai_tag}"
+        ),
         color=0x9B59B6,
     )
     embed.add_field(

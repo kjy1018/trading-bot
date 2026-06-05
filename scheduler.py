@@ -45,6 +45,7 @@ from stock_names import (
 )
 from brain import (
     enrich_stock_with_brain,
+    explain_universe_load_paths,
     pick_brain_recommendations,
     plan_theme_actions,
     theme_timeline_hints,
@@ -168,6 +169,7 @@ _state: dict[str, Any] = {
     "buy_paused": False,
     "daily_close_report": None,
     "daily_close_report_date": None,
+    "ml_guard_alert": None,
 }
 
 _positions: dict[str, dict[str, Any]] = {}
@@ -567,6 +569,101 @@ def _clear_position_order_pending(code: str, ticket_id: str | None = None) -> No
     _sync_positions_state()
 
 
+def _finalize_and_drop_order(ticket_id: str, message: str) -> None:
+    """실패·고착 주문 — rejected 기록 후 큐(_orders)에서 즉시 제거."""
+    if not ticket_id:
+        return
+    with _orders_lock:
+        order = dict(_orders.get(ticket_id) or {})
+    if not order:
+        return
+    code = normalize_code(order.get("code"))
+    try:
+        _update_order_state(ticket_id, status="rejected", message=message)
+    except Exception as exc:
+        logger.warning("주문 rejected 기록 실패 %s: %s", ticket_id, exc)
+    with _orders_lock:
+        _orders.pop(ticket_id, None)
+    _clear_position_order_pending(code, ticket_id)
+    if str(order.get("action")) == "buy":
+        slot_uid = str(order.get("slot_uid") or "").strip()
+        if slot_uid:
+            try:
+                from portfolio_manager import release_slot_lock_by_uid
+
+                release_slot_lock_by_uid(slot_uid, code=code)
+                _apply_runtime_positions_from_store()
+                _sync_positions_state()
+            except Exception as exc:
+                logger.debug("매수 실패 Lock 해제 스킵 %s: %s", slot_uid, exc)
+    logger.warning(
+        "주문 큐 제거 ticket=%s %s(%s) action=%s — %s",
+        ticket_id,
+        order.get("name") or code,
+        code,
+        order.get("action"),
+        message,
+    )
+    _publish_order_snapshot()
+    _wake_engine()
+
+
+def _purge_stuck_orders(*, max_age_sec: float | None = None) -> int:
+    """queued/submitting 상태로 고착된 주문 일괄 제거."""
+    dropped = 0
+    with _orders_lock:
+        snapshot = [dict(v) for v in _orders.values()]
+    for order in snapshot:
+        status = str(order.get("status") or "")
+        if status not in {"queued", "submitting"}:
+            continue
+        tid = str(order.get("ticket_id") or "")
+        if not tid:
+            continue
+        _finalize_and_drop_order(
+            tid,
+            f"stuck order purge ({status}, >{int(max_age_sec or 0)}s hard refresh)",
+        )
+        dropped += 1
+    if dropped:
+        logger.warning("고착 주문 %d건 큐에서 제거", dropped)
+    return dropped
+
+
+def _force_engine_hard_refresh(reason: str) -> None:
+    """감시 시각 정체·스캔 락 고착 시 — 스캔 재시작 유도."""
+    global _scan_active, _last_scan_at
+    with _scan_active_lock:
+        if _scan_active:
+            logger.warning("Hard Refresh — scan_active 락 해제")
+            _scan_active = False
+    _last_scan_at = 0.0
+    _purge_stuck_orders(max_age_sec=float(getattr(config, "ORDER_STUCK_PURGE_SEC", 45)))
+    summary = f"엔진 Hard Refresh — {reason}"
+    _mark_scan_completed(summary)
+    _record_job_failure(RuntimeError(summary))
+    _wake_engine()
+    logger.warning(summary)
+
+
+def _maybe_hard_refresh_if_watch_stale(now_dt: datetime) -> None:
+    """장중 최근 감시 시각이 2분+ 밀리면 Hard Refresh."""
+    if not _is_weekday():
+        return
+    now_t = now_dt.time()
+    if now_t < SCAN_START or now_t >= SCAN_END:
+        return
+    stale_sec = float(getattr(config, "WATCH_STALE_HARD_REFRESH_SEC", 120))
+    snap = get_watch_time_snapshot()
+    epoch = float(snap.get("epoch") or 0)
+    if epoch <= 0:
+        return
+    age = time.time() - epoch
+    if age < stale_sec:
+        return
+    _force_engine_hard_refresh(f"감시 시각 {int(age)}초 지연 (>{int(stale_sec)}초)")
+
+
 def _refresh_account_snapshot(
     force: bool = False,
     *,
@@ -606,6 +703,8 @@ def _refresh_account_snapshot(
             return stale
         raise
     snap["stale"] = False
+    if sync_runtime_positions:
+        _watch_broker_holdings_changes(snap)
     if publish_to_state:
         with _state_lock:
             _state["account_snapshot"] = snap
@@ -666,6 +765,13 @@ def _should_run_realtime_scan() -> bool:
         return False
     if not _is_weekday() or not _in_scan_window(datetime.now().time()):
         return False
+    if getattr(config, "PRIORITY_MANAGE_DISTRESSED_BLOCK_NEW_BUYS", True):
+        if _has_distressed_holdings():
+            logger.info(
+                "신규 매수 스캔 보류 — 손실 %.1f%% 이하 보유 종목 우선 관리 중",
+                float(getattr(config, "PANIC_STOP_LOSS_PCT", -5.0)),
+            )
+            return False
     if _last_scan_at <= 0:
         return True
     return time.time() - _last_scan_at >= _scan_debounce_sec()
@@ -760,9 +866,26 @@ def _commander_slots_from_positions() -> list[dict[str, Any]]:
     )
 
 
-def _reload_universe_cache(token: str, *, refresh_ai: bool = True) -> list[dict[str, Any]]:
-    """유니버스 캐시 강제 갱신 + (선택) AI 예측."""
+def _reload_universe_cache(
+    token: str,
+    *,
+    refresh_ai: bool = True,
+    reason: str = "unspecified",
+) -> list[dict[str, Any]]:
+    """유니버스 캐시 강제 갱신 + (선택) AI 예측. (_refresh_universe 와 동일)"""
     global _universe_cache, _universe_cache_at
+    logger.info(
+        "_refresh_universe [%s] — build_brain_universe 시작 (파일 load 없음 · KIS API)",
+        reason,
+    )
+    paths = explain_universe_load_paths()
+    logger.info(
+        "_refresh_universe [%s] — 참고 파일: modes=%s slots=%s positions=%s",
+        reason,
+        paths["files_not_universe_list"]["selected_modes.json"]["path"],
+        paths["files_not_universe_list"]["slots_config.json"]["path"],
+        paths["files_not_universe_list"]["positions_state.json"]["path"],
+    )
     with _universe_lock:
         ranked = get_swing_universe(token, config.APP_KEY, config.APP_SECRET)
         _universe_cache = ranked
@@ -780,8 +903,25 @@ def _reload_universe_cache(token: str, *, refresh_ai: bool = True) -> list[dict[
                 _sync_ai_forecast_to_state(ai)
             except Exception as exc:
                 logger.warning("AI 예측 갱신 실패: %s", exc)
+    codes_preview = [str(s.get("code")) for s in ranked[:8]]
+    logger.info(
+        "_refresh_universe [%s] — 완료 %d종목 · 상위코드 %s",
+        reason,
+        len(ranked),
+        codes_preview,
+    )
     _sync_ws_watchlist()
     return ranked
+
+
+def _refresh_universe(
+    token: str,
+    *,
+    refresh_ai: bool = True,
+    reason: str = "unspecified",
+) -> list[dict[str, Any]]:
+    """유니버스 집계 — _reload_universe_cache 별칭 (로그·진단용 이름)."""
+    return _reload_universe_cache(token, refresh_ai=refresh_ai, reason=reason)
 
 
 def _get_universe_cached(token: str) -> list[dict[str, Any]]:
@@ -793,7 +933,7 @@ def _get_universe_cached(token: str) -> list[dict[str, Any]]:
         _sync_ui_recommendations_from_universe()
         _sync_ws_watchlist()
         return _universe_cache
-    return _reload_universe_cache(token, refresh_ai=False)
+    return _reload_universe_cache(token, refresh_ai=False, reason="cache_expired")
 
 
 def _sync_ai_forecast_to_state(ai: dict[str, Any]) -> None:
@@ -917,6 +1057,56 @@ def _force_refresh_trade_state_sync(reason: str = "") -> None:
     _apply_trade_state_to_memory()
 
 
+def _watch_broker_holdings_changes(snap: dict[str, Any]) -> None:
+    """증권사 잔고 수량 변화 — 주문 체결 알림 누락 시 디스코드 백업."""
+    from holdings_watch import process_holdings_snapshot
+
+    def _on_change(ev: dict[str, Any]) -> None:
+        if not (_is_weekday() and _in_scan_window(datetime.now().time())):
+            return
+        kind = str(ev.get("kind") or "")
+        code = str(ev.get("code") or "")
+        name = str(ev.get("name") or code)
+        old_qty = int(ev.get("old_qty") or 0)
+        new_qty = int(ev.get("new_qty") or 0)
+        delta = int(ev.get("delta_qty") or 0)
+        if kind == "partial_sell":
+            detail = "계좌 동기화 — 분할 익절·부분 매도 가능성"
+        elif kind == "sold_out":
+            detail = "계좌 동기화 — 전량 매도 완료"
+        elif kind == "new_holding":
+            detail = "계좌 동기화 — 신규 보유 반영"
+        else:
+            detail = "계좌 동기화 — 보유 수량 변화"
+        try:
+            _notifier.send_holding_change(
+                change_kind=kind,
+                code=code,
+                name=name,
+                old_qty=old_qty,
+                new_qty=new_qty,
+                delta_qty=delta,
+                detail=detail,
+            )
+        except Exception as exc:
+            logger.debug("보유 변동 알림 실패 %s: %s", code, exc)
+
+    try:
+        events = process_holdings_snapshot(
+            snap.get("holdings"),
+            notify=_on_change,
+            has_pending_sell_order=lambda c: _is_code_order_pending(c, {"sell"}),
+        )
+        if events:
+            logger.info(
+                "보유 변동 감지 %d건: %s",
+                len(events),
+                ", ".join(f"{e.get('code')}({e.get('kind')})" for e in events),
+            )
+    except Exception as exc:
+        logger.debug("보유 변동 감시 실패: %s", exc)
+
+
 def _safe_notify_fill(
     side: str,
     code: str,
@@ -981,13 +1171,26 @@ def _daily_summary_from_snapshot(
     slot_count: int,
 ) -> dict[str, Any]:
     """KIS 잔고 스냅샷 기반 장시작/장마감 영수증 지표."""
-    stock_eval = int(snap.get("stock_eval") or snap.get("total_eval") or 0)
-    cash = int(snap.get("cash") or 0)
+    from report import normalize_settlement_for_report, purge_phantom_positions_if_broker_empty
+
+    purge_phantom_positions_if_broker_empty(snap)
+    try:
+        bot_positions = trade_state.load_persisted_positions()
+    except Exception:
+        bot_positions = None
+    settlement = normalize_settlement_for_report(snap, positions=bot_positions)
+    stock_eval = int(settlement.get("stock_eval") or snap.get("stock_eval") or 0)
+    cash = int(settlement.get("cash") or snap.get("cash") or 0)
     bot = _bot_allocation_metrics()
     return {
-        "daily_eval_pnl": int(snap.get("daily_eval_pnl") or 0),
-        "daily_eval_pnl_pct": float(snap.get("daily_eval_pnl_pct") or 0.0),
-        "total_return_pct": float(snap.get("total_return_pct") or 0.0),
+        "daily_eval_pnl": int(settlement["daily_eval_pnl"]),
+        "daily_eval_pnl_pct": float(settlement["daily_eval_pnl_pct"]),
+        "total_return_pct": float(settlement["return_rate"]),
+        "settlement_return_pct": float(settlement["return_rate"]),
+        "settlement_profit_loss": int(settlement["profit_loss"]),
+        "settlement_total_assets": int(settlement["total_assets"]),
+        "total_purchase_amt": int(snap.get("total_purchase_amt") or 0),
+        "total_eval_pnl": int(snap.get("total_eval_pnl") or 0),
         "slot_count": slot_count,
         "stock_eval": stock_eval,
         "total_eval": stock_eval,
@@ -1064,20 +1267,79 @@ def _maybe_send_market_open_summary(now_dt: datetime) -> None:
     window_min = int(getattr(config, "NOTIFY_MARKET_OPEN_SUMMARY_WINDOW_MIN", 10))
     if not _summary_send_window_ok(now_dt, start=open_t, window_min=window_min):
         return
-    _last_open_summary_sent_date = today_key
+    try:
+        force_send_market_open_summary(tag="장시작 직후", mark_sent=True)
+    except Exception as exc:
+        logger.exception("장시작 요약 발송 실패: %s", exc)
+
+
+def force_send_market_open_summary(
+    *,
+    tag: str = "장시작 직후 (수동)",
+    mark_sent: bool = False,
+    include_holdings: bool = True,
+) -> dict[str, Any]:
+    """
+    장시작/수동 계좌·보유 보고 — 스케줄 창 밖에서도 즉시 발송.
+    mark_sent=True 이면 당일 자동 장시작 알림 중복 방지 플래그 설정.
+    """
+    global _last_open_summary_sent_date
     stats = get_daily_stats(force_refresh=True)
     with _state_lock:
         slot_count = int(_state.get("slot_count") or 0)
     snap = _refresh_account_snapshot(force=True)
-    _notifier.send_daily_summary(
-        tag="장시작 직후",
-        **_daily_summary_from_snapshot(snap, stats=stats, slot_count=slot_count),
-    )
+    payload = _daily_summary_from_snapshot(snap, stats=stats, slot_count=slot_count)
+    _notifier.send_daily_summary(tag=tag, **payload)
+    holdings_msg = ""
+    if include_holdings:
+        positions = get_positions_snapshot()
+        if not positions:
+            try:
+                positions = list(trade_state.load_persisted_positions().values())
+            except Exception:
+                positions = []
+        holdings_msg = _format_holdings_report_text(positions)
+        if holdings_msg:
+            _notifier.send_text(holdings_msg)
+    if mark_sent:
+        _last_open_summary_sent_date = date.today().isoformat()
+    logger.info("장시작/수동 요약 발송 완료 tag=%s slots=%d", tag, slot_count)
+    return {
+        "success": True,
+        "tag": tag,
+        "slot_count": slot_count,
+        "return_rate": payload.get("total_return_pct"),
+        "holdings_sent": bool(holdings_msg),
+    }
+
+
+def _format_holdings_report_text(positions: list[dict[str, Any]]) -> str:
+    """보유 종목 텍스트 블록 — 디스코드 수동 보고용."""
+    rows: list[str] = []
+    for pos in positions:
+        qty = int(pos.get("quantity") or 0)
+        if qty <= 0:
+            continue
+        name = str(pos.get("name") or pos.get("code") or "?")
+        code = str(pos.get("code") or "")
+        entry = int(pos.get("entry_price") or 0)
+        current = int(pos.get("current_price") or entry)
+        pct = float(pos.get("profit_pct") or 0.0)
+        mode = str(pos.get("mode_label") or pos.get("trading_mode") or "-")
+        tgt = pos.get("target_profit_pct")
+        tgt_txt = f" · 목표 +{float(tgt):.1f}%" if tgt is not None else ""
+        rows.append(
+            f"· {name}({code}) {qty}주 · {mode} · "
+            f"평단 {entry:,} → {current:,} ({pct:+.2f}%){tgt_txt}"
+        )
+    if not rows:
+        return "📋 **보유 종목** — 없음"
+    return "📋 **보유 종목**\n" + "\n".join(rows)
 
 
 def _maybe_send_daily_close_summary(now_dt: datetime) -> None:
     """
-    일일 결산 영수증 — NOTIFY_MARKET_CLOSE_SUMMARY_TIME(기본 15:35)에 당일 1회만.
+    일일 결산 영수증 — NOTIFY_MARKET_CLOSE_SUMMARY_TIME(기본 16:00)에 당일 1회만.
     18:00 리마인드·확인 버튼 재발송 없음.
     """
     global _last_close_summary_sent_date
@@ -1120,7 +1382,7 @@ def _maybe_send_daily_close_summary(now_dt: datetime) -> None:
 
 
 def _maybe_send_daily_close_report(now_dt: datetime) -> None:
-    """15:30 마감 직후 — DB 복기·지수·보유 MA·내일 전략 리포트."""
+    """16:00 정산 — DB 복기·지수·보유 MA·내일 전략 리포트 (수익률 = 대시보드 공식)."""
     global _last_close_report_sent_date
     if not bool(getattr(config, "ENABLE_DAILY_CLOSE_REPORT", True)):
         return
@@ -1224,11 +1486,19 @@ def _reset_daily_stats_if_needed() -> None:
 
 
 def _bootstrap_positions_from_store() -> None:
-    """메모리 포지션 스토어 → 스케줄러 _positions (기동·잔고 동기화 후)."""
+    """Config 우선 로드 후 스케줄러 _positions 동기화."""
     global _positions
-    from slot_registry import reconcile_holdings_to_slots
+    from slot_registry import apply_config_to_portfolio_state, reconcile_holdings_to_slots
 
+    trade_state.reload_positions_state_from_disk(bump_revision=False)
     persisted = trade_state.load_persisted_positions()
+    slots = trade_state.get_slots_book()
+    positions, slots = apply_config_to_portfolio_state(
+        persisted,
+        slots,
+        recalc_targets=True,
+    )
+
     token: str | None = None
     try:
         token = get_access_token()
@@ -1236,37 +1506,13 @@ def _bootstrap_positions_from_store() -> None:
         pass
     with _positions_lock:
         _positions = {}
-        for code, pos in persisted.items():
-            enriched = enrich_position(pos, access_token=token)
-            _positions[code] = enriched
-        for code, pos in list(_positions.items()):
-            if not pos.get("stop_loss_price"):
-                _backfill_missing_atr_stop(code, pos)
-            if not pos.get("target_price"):
-                _ensure_position_targets(code, pos)
-            else:
-                refresh_target_live_fields(pos)
-    slots = trade_state.get_slots_book()
-    with _positions_lock:
-        snap = {c: dict(p) for c, p in _positions.items()}
-    reconcile_holdings_to_slots(slots, snap)
-    with _positions_lock:
-        for code, pos in snap.items():
-            if not isinstance(pos, dict):
+        for code, pos in positions.items():
+            norm = normalize_code(code)
+            if len(norm) != 6:
                 continue
-            live = _positions.get(code)
-            if not isinstance(live, dict):
-                continue
-            for key in (
-                "slot_uid",
-                "slot_id",
-                "slot_type",
-                "slot_personality",
-                "display_idx",
-                "trading_mode",
-            ):
-                if pos.get(key) is not None:
-                    live[key] = pos.get(key)
+            _positions[norm] = enrich_position(dict(pos), access_token=token)
+
+    reconcile_holdings_to_slots(slots, {c: dict(p) for c, p in _positions.items()})
     trade_state.save_portfolio_state(
         {c: dict(p) for c, p in _positions.items()},
         slots,
@@ -1617,8 +1863,11 @@ def _process_pyramid_for_code(code: str) -> None:
 
 
 def _process_pyramid_additions() -> None:
-    """정찰대 전 종목 피라미딩 스윕."""
-    for code in list(_get_all_positions().keys()):
+    """추가 매수 — 손실 보유 종목 우선(물타기/적립), 이후 일반 스윕."""
+    distressed_codes = [c for c, _, _ in _distressed_holdings()]
+    all_codes = list(_get_all_positions().keys())
+    ordered = distressed_codes + [c for c in all_codes if c not in distressed_codes]
+    for code in ordered:
         _process_pyramid_for_code(code)
 
 
@@ -1629,7 +1878,19 @@ def _get_position_count() -> int:
 
 def _get_held_codes() -> set[str]:
     with _positions_lock:
-        return set(_positions.keys())
+        codes = set(_positions.keys())
+    try:
+        from slot_registry import SLOT_STATUS_LOCKED
+
+        for entry in trade_state.get_slots_book().values():
+            if str(entry.get("status") or "") != SLOT_STATUS_LOCKED:
+                continue
+            c = str(entry.get("code") or "").strip()
+            if len(c) == 6:
+                codes.add(c)
+    except Exception:
+        pass
+    return codes
 
 
 def _get_all_positions() -> dict[str, dict[str, Any]]:
@@ -1637,18 +1898,227 @@ def _get_all_positions() -> dict[str, dict[str, Any]]:
         return {code: dict(pos) for code, pos in _positions.items()}
 
 
+def _position_profit_pct(pos: dict[str, Any]) -> float:
+    entry = int(pos.get("entry_price") or 0)
+    current = int(pos.get("current_price") or entry)
+    if entry <= 0:
+        return 0.0
+    return (current - entry) / entry * 100.0
+
+
+def _panic_stop_threshold() -> float:
+    return float(getattr(config, "PANIC_STOP_LOSS_PCT", -5.0))
+
+
+def _distressed_holdings(
+    threshold: float | None = None,
+) -> list[tuple[str, dict[str, Any], float]]:
+    """평가손익 threshold 이하 보유 (가장 큰 손실 순)."""
+    thr = _panic_stop_threshold() if threshold is None else float(threshold)
+    rows: list[tuple[str, dict[str, Any], float]] = []
+    for code, pos in _get_all_positions().items():
+        pct = _position_profit_pct(pos)
+        if pct <= thr:
+            rows.append((code, pos, pct))
+    rows.sort(key=lambda x: x[2])
+    return rows
+
+
+def _has_distressed_holdings(threshold: float | None = None) -> bool:
+    """보유 종목 중 손실률이 -5%(PANIC_STOP_LOSS_PCT) 이하인 종목이 있으면 True."""
+    return bool(_distressed_holdings(threshold))
+
+
+def _record_ml_guard_alert(result: dict[str, Any]) -> None:
+    """대시보드 [AI 가드] 경고용 — 최근 ML 매수 판정 스냅샷."""
+    with _state_lock:
+        _state["ml_guard_alert"] = {
+            "blocked": bool(result.get("reject")),
+            "code": result.get("code"),
+            "name": result.get("name"),
+            "prob": result.get("prob"),
+            "prob_pct": (
+                round(float(result["prob"]) * 100.0, 1)
+                if result.get("prob") is not None
+                else None
+            ),
+            "pred_class": result.get("pred_class"),
+            "threshold_pct": round(float(result.get("threshold") or 0) * 100.0, 0),
+            "message": result.get("dashboard_message") or "",
+            "detail": result.get("detail") or "",
+            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+
+def _fetch_target_hourly_bars(code: str) -> list[dict] | None:
+    """모드 변경·목표가 재산출용 60분봉."""
+    norm = normalize_code(code)
+    if len(norm) != 6:
+        return None
+    try:
+        token = get_access_token()
+        return _fetch_hourly_bars(token, config.APP_KEY, config.APP_SECRET, norm)
+    except Exception as exc:
+        logger.warning("목표가용 1H 봉 조회 실패 %s: %s", norm, exc)
+        return None
+
+
 def _ensure_position_targets(code: str, position: dict[str, Any]) -> None:
     """뇌 모드별 예상 매도가 — positions_state.json 저장 필드."""
     if int(position.get("target_price") or 0) > 0:
         refresh_target_live_fields(position)
         return
-    hourly: list[dict] | None = None
+    hourly = _fetch_target_hourly_bars(code)
+    apply_expected_exit_to_position(position, hourly_bars=hourly)
+
+
+def _reload_position_tactics_on_mode_change(
+    pos: dict[str, Any],
+    mode_value: str,
+    *,
+    slot_uid: str | None = None,
+) -> None:
+    """슬롯/모드 변경 — 전술·목표가·손절 즉시 재계산 (메모리 in-place)."""
+    pos.update(_mode_tags_for_value(mode_value))
+    pos["trading_mode"] = mode_value
+    pos["slot_type"] = mode_value
+    pos["slot_id"] = mode_value
+    pos["slot_personality"] = mode_value
+    if slot_uid:
+        pos["slot_uid"] = slot_uid
+    pos["updated_at"] = _now_text()
+
+    code = normalize_code(pos.get("code"))
+    hourly = _fetch_target_hourly_bars(code) if code else None
+    refresh_target_live_fields(pos, force_recalc=True, hourly_bars=hourly)
+    if mode_value == "swing" and code and not pos.get("stop_loss_price"):
+        _backfill_missing_atr_stop(code, pos)
+
+
+def _commit_slot_portfolio_reload(
+    *,
+    reason: str,
+    slots: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    """positions_state.json + trade_state 메모리 + UI 스냅샷 즉시 동기화."""
+    with _positions_lock:
+        snap = {c: dict(p) for c, p in _positions.items()}
+    book = slots if slots is not None else trade_state.get_slots_book()
+    trade_state.save_portfolio_state(snap, book)
+    trade_state.request_dashboard_refresh(reason)
+    _sync_positions_state()
+    _update_engine_mode_from_state()
+    _wake_engine()
+    try:
+        from bot_config_reload import finalize_config_write
+
+        finalize_config_write()
+    except ImportError:
+        pass
+
+
+_last_engine_config_nonce: int = 0
+
+
+def reload_engine_from_disk(
+    *,
+    reason: str = "manual",
+    slot_uid: str | None = None,
+    mode_value: str | None = None,
+    force_recalc_targets: bool = True,
+) -> dict[str, Any]:
+    """
+    Config 우선 재로드 — selected_modes/slots_config → positions_state 정렬.
+    """
+    from bot_config_reload import (
+        export_slots_config_snapshot,
+        finalize_config_write,
+        reload_config,
+        suppress_file_watch,
+    )
+    from slot_registry import apply_config_to_portfolio_state
+
+    suppress_file_watch(3.0)
+    reload_config(reason)
+    trade_state.reload_positions_state_from_disk(bump_revision=True)
+    persisted = trade_state.load_persisted_positions()
+    slots = trade_state.get_slots_book()
+
+    token: str | None = None
     try:
         token = get_access_token()
-        hourly = _fetch_hourly_bars(token, config.APP_KEY, config.APP_SECRET, code)
+    except Exception:
+        pass
+
+    positions, slots = apply_config_to_portfolio_state(
+        persisted,
+        slots,
+        recalc_targets=force_recalc_targets,
+    )
+
+    reloaded_codes: list[str] = []
+    with _positions_lock:
+        _positions.clear()
+        for code, pos in positions.items():
+            norm = normalize_code(code)
+            if len(norm) != 6:
+                continue
+            enriched = enrich_position(dict(pos), access_token=token)
+            _positions[norm] = enriched
+            uid = str(enriched.get("slot_uid") or "").strip()
+            if not slot_uid or uid == str(slot_uid):
+                reloaded_codes.append(norm)
+
+    export_slots_config_snapshot(slots, reason=reason)
+    _commit_slot_portfolio_reload(reason=reason, slots=slots)
+    finalize_config_write()
+    logger.info(
+        "reload_engine_from_disk: %s · positions=%d · targets_recalc=%s",
+        reason,
+        len(_positions),
+        reloaded_codes,
+    )
+    return {
+        "success": True,
+        "reason": reason,
+        "position_count": len(_positions),
+        "reloaded_codes": reloaded_codes,
+    }
+
+
+def _maybe_reload_engine_config() -> None:
+    """nonce 또는 설정 파일 mtime 변경 시 디스크 → 엔진 메모리 재동기화."""
+    global _last_engine_config_nonce
+    from bot_config_reload import detect_config_file_changes
+
+    nonce = trade_state.get_engine_config_reload_nonce()
+    file_changed = detect_config_file_changes()
+    if nonce == _last_engine_config_nonce and not file_changed:
+        return
+    _last_engine_config_nonce = nonce
+    reason = trade_state.get_engine_config_reload_reason() or "file_change"
+    try:
+        reload_engine_from_disk(reason=reason, force_recalc_targets=True)
     except Exception as exc:
-        logger.warning("예상 매도가용 1H 봉 조회 실패 %s: %s", code, exc)
-    apply_expected_exit_to_position(position, hourly_bars=hourly)
+        logger.exception("엔진 설정 재로딩 실패 (%s): %s", reason, exc)
+
+
+def apply_dashboard_slot_mode_change(
+    slot_idx: int,
+    mode_label: str,
+    code: str = "",
+) -> dict[str, Any]:
+    """Streamlit selectbox on_change — 파일 저장 + 목표가 재산출 + 엔진 reload."""
+    result = set_slot_personality(int(slot_idx), str(mode_label))
+    if not result.get("success"):
+        return result
+    reload_engine_from_disk(
+        reason=f"dashboard_slot_{slot_idx}",
+        slot_uid=str(result.get("slot_uid") or "") or None,
+        mode_value=str(result.get("trading_mode") or "") or None,
+        force_recalc_targets=True,
+    )
+    return result
 
 
 def update_position_trading_mode(code: str, trading_mode: str) -> dict[str, Any]:
@@ -1663,30 +2133,18 @@ def _apply_live_mode_to_position_code(code: str, trading_mode: str) -> dict[str,
         pos = _positions.get(norm)
         if not pos:
             return {"success": False, "message": "보유 포지션을 찾을 수 없습니다."}
-        pos.update(_mode_tags_for_value(mode_value))
-        pos["trading_mode"] = mode_value
-        pos["slot_type"] = mode_value
-        pos["slot_id"] = mode_value
+        slot_uid = str(pos.get("slot_uid") or "").strip() or None
         try:
             from selected_modes import save_mode
 
             save_mode(norm, str(trading_mode))
         except ImportError:
             pass
-        pos["updated_at"] = _now_text()
-        pos.pop("target_price", None)
-        pos.pop("target_profit_pct", None)
-        pos.pop("target_kind", None)
-        pos.pop("target_note", None)
-        pos.pop("target_display", None)
-        pos.pop("target_ceiling_price", None)
-        apply_tactical_fields_on_position(pos)
-        apply_expected_exit_to_position(pos, hourly_bars=None, force_recalc=True)
+        _reload_position_tactics_on_mode_change(
+            pos, mode_value, slot_uid=slot_uid
+        )
         snapshot = dict(pos)
-    _maybe_persist_positions(force=True)
-    _sync_positions_state()
-    _update_engine_mode_from_state()
-    _wake_engine()
+    _commit_slot_portfolio_reload(reason=f"mode_change:{norm}")
     return {
         "success": True,
         "message": f"{snapshot.get('name', norm)} 모드를 {snapshot.get('mode_label', '스윙')}로 변경했습니다.",
@@ -1722,41 +2180,41 @@ def set_slot_personality(slot_idx: int, mode_label: str) -> dict[str, Any]:
     if not set_slot_personality_in_book(slots, uid, mode_value):
         return {"success": False, "message": f"슬롯 {idx} 성격 저장 실패"}
 
-    try:
-        from selected_modes import sync_slot_mode
-
-        sync_slot_mode(idx, label, None)
-    except ImportError:
-        pass
-
     held_code: str | None = None
     entry = slots.get(uid) or {}
     if str(entry.get("status") or "empty") == "filled":
         held_code = str(entry.get("code") or "").strip() or None
 
-    with _positions_lock:
-        if held_code and held_code in _positions:
-            pos = _positions[held_code]
-            pos.update(_mode_tags_for_value(mode_value))
-            pos["trading_mode"] = mode_value
-            pos["slot_type"] = mode_value
-            pos["slot_id"] = mode_value
-            pos["slot_uid"] = uid
-            pos["updated_at"] = _now_text()
-            pos.pop("target_price", None)
-            pos.pop("target_profit_pct", None)
-            pos.pop("target_kind", None)
-            pos.pop("target_note", None)
-            pos.pop("target_display", None)
-            pos.pop("target_ceiling_price", None)
-            apply_tactical_fields_on_position(pos)
-            apply_expected_exit_to_position(pos, hourly_bars=None, force_recalc=True)
-        snap = {c: dict(p) for c, p in _positions.items()}
+    try:
+        from selected_modes import sync_slot_mode
 
-    trade_state.save_portfolio_state(snap, slots)
-    _sync_positions_state()
-    _update_engine_mode_from_state()
-    _wake_engine()
+        sync_slot_mode(idx, label, held_code)
+    except ImportError:
+        pass
+
+    with _positions_lock:
+        if held_code:
+            norm_held = normalize_code(held_code)
+            if norm_held not in _positions:
+                persisted = trade_state.load_persisted_positions()
+                if norm_held in persisted:
+                    _positions[norm_held] = dict(persisted[norm_held])
+            if norm_held in _positions:
+                _reload_position_tactics_on_mode_change(
+                    _positions[norm_held],
+                    mode_value,
+                    slot_uid=uid,
+                )
+
+    from bot_config_reload import export_slots_config_snapshot, reload_config
+
+    export_slots_config_snapshot(slots, reason=f"slot_mode:{idx}:{mode_value}")
+    reload_config(f"slot_mode:{idx}:{mode_value}")
+
+    _commit_slot_portfolio_reload(
+        reason=f"slot_mode:{idx}:{mode_value}",
+        slots=slots,
+    )
 
     ko = MODE_LABEL_KO.get(
         next((m for m in TradingMode if m.value == mode_value), TradingMode.SWING),
@@ -1787,13 +2245,11 @@ def _sync_position_live_mode_from_slot(code: str) -> None:
         cur = normalize_trading_category(pos.get("trading_mode"))
         if cur == live_mode and normalize_trading_category(pos.get("slot_type")) == live_mode:
             return
-        pos.update(_mode_tags_for_value(live_mode))
-        pos["trading_mode"] = live_mode
-        pos["slot_type"] = live_mode
-        pos["slot_id"] = live_mode
-        apply_tactical_fields_on_position(pos)
-        apply_expected_exit_to_position(pos, hourly_bars=None, force_recalc=True)
-        pos["updated_at"] = _now_text()
+        _reload_position_tactics_on_mode_change(
+            pos,
+            live_mode,
+            slot_uid=str(pos.get("slot_uid") or "").strip() or None,
+        )
 
 
 def _add_position(position: dict[str, Any], *, slot_id: str | None = None) -> None:
@@ -1961,6 +2417,8 @@ def _apply_confirmed_buy_fill(order: dict[str, Any], holding: dict[str, Any]) ->
         fill_price,
         entry_basis=str(order.get("entry_basis") or "async_fill_confirmed"),
     )
+    payload.pop("slot_lock", None)
+    payload.pop("slot_lock_at", None)
     slot_uid = str(
         order.get("slot_uid") or payload.get("slot_uid") or order.get("slot_id") or ""
     ).strip()
@@ -2069,6 +2527,11 @@ def _apply_confirmed_sell_fill(order: dict[str, Any], remaining_qty: int) -> str
                 done = int(live.get("long_force_exit_stage") or 0)
                 live["long_force_exit_stage"] = done + 1
                 live["long_force_exit_at"] = _now_text()
+            if "분할 익절" in reason:
+                live["quick_half_profit_stage"] = max(
+                    1, int(live.get("quick_half_profit_stage") or 0)
+                )
+                live["quick_half_profit_at"] = _now_text()
             if new_qty <= 0 or remaining_qty <= 0:
                 released_slot = str(
                     live.get("slot_uid")
@@ -2229,6 +2692,112 @@ def _polling_refresh_balance_if_due() -> None:
         logger.debug("폴링 잔고 동기화 실패: %s", exc)
 
 
+def _run_panic_stop_loss_loop() -> None:
+    """
+    강제 손절 — 평가손익 ≤ PANIC_STOP_LOSS_PCT(-5%) 시 모드 무관 시장가 청산.
+    PANIC_STOP_SELL_FRACTION=0.5 이면 1차 절반, 2차 잔량 전량.
+    """
+    thr = _panic_stop_threshold()
+    for code, pos, profit_pct in _distressed_holdings(thr):
+        if _is_code_order_pending(code, {"sell", "buy", "pyramid_buy"}):
+            continue
+        if pos.get("pending_order_ticket"):
+            continue
+        stage = int(pos.get("panic_stop_stage") or 0)
+        if stage >= 2:
+            continue
+        reason = f"패닉 손절 ({profit_pct:+.2f}% ≤ {thr:.1f}%)"
+        order = _enqueue_sell_order(code, reason, prefer_market=True)
+        if not order:
+            logger.warning(
+                "[패닉손절] 접수 실패 %s(%s) %+.2f%%",
+                pos.get("name"),
+                code,
+                profit_pct,
+            )
+            continue
+        with _positions_lock:
+            live = _positions.get(code)
+            if live:
+                live["panic_stop_stage"] = stage + 1
+                live["panic_stop_at"] = _now_text()
+        _maybe_persist_positions(False)
+        msg = (
+            f"[패닉손절] {pos.get('name')}({code}) {profit_pct:+.2f}% "
+            f"· 티켓 {order['ticket_id']}"
+        )
+        _record_job_success(msg)
+        logger.warning(msg)
+
+
+def _recommend_holdings_action(
+    pos: dict[str, Any],
+    profit_pct: float,
+) -> str:
+    """진단용 — 보유 종목 대응 전략 요약."""
+    thr = _panic_stop_threshold()
+    if profit_pct <= thr:
+        frac = float(getattr(config, "PANIC_STOP_SELL_FRACTION", 0.5))
+        stage = int(pos.get("panic_stop_stage") or 0)
+        if stage >= 2:
+            return "패닉 손절 완료(전량 청산 시도됨)"
+        sell_txt = "전량" if frac >= 1.0 else "절반"
+        return f"패닉 손절 대상 → 시장가 {sell_txt} 청산 (stage={stage})"
+    mode = str(pos.get("trading_mode") or "swing")
+    drop = -profit_pct if profit_pct < 0 else 0.0
+    if mode == "swing" and 2.5 <= drop <= 8.0:
+        adds = int(pos.get("swing_add_count") or 0)
+        return f"스윙 분할매수(물타기) 검토 가능 — 눌림 {drop:.1f}% · add {adds}회"
+    if mode == "long_term" and profit_pct < 0:
+        return "장투 적립식 매수(물타기) 또는 패닉 구간 진입 시 손절"
+    if profit_pct > 0:
+        return "익절·트레일링 감시 유지"
+    return "일반 청산 규칙(decide_position_exit) 감시"
+
+
+def diagnose_holdings_management(
+    positions: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """보유 종목 손익·대응 전략 진단 리포트."""
+    if positions is None:
+        positions = _get_all_positions()
+    thr = _panic_stop_threshold()
+    rows: list[dict[str, Any]] = []
+    for code, pos in positions.items():
+        pct = _position_profit_pct(pos)
+        rows.append(
+            {
+                "code": code,
+                "name": pos.get("name") or code,
+                "mode": pos.get("trading_mode") or pos.get("mode_label"),
+                "profit_pct": round(pct, 2),
+                "entry_price": int(pos.get("entry_price") or 0),
+                "current_price": int(pos.get("current_price") or 0),
+                "quantity": int(pos.get("quantity") or 0),
+                "panic_stop_stage": int(pos.get("panic_stop_stage") or 0),
+                "distressed": pct <= thr,
+                "action": _recommend_holdings_action(pos, pct),
+            }
+        )
+    rows.sort(key=lambda r: float(r.get("profit_pct") or 0))
+    distressed = [r for r in rows if r.get("distressed")]
+    return {
+        "panic_threshold_pct": thr,
+        "panic_sell_fraction": float(getattr(config, "PANIC_STOP_SELL_FRACTION", 0.5)),
+        "block_new_buys": bool(
+            getattr(config, "PRIORITY_MANAGE_DISTRESSED_BLOCK_NEW_BUYS", True)
+        )
+        and bool(distressed),
+        "holdings_count": len(rows),
+        "distressed_count": len(distressed),
+        "holdings": rows,
+        "summary": (
+            f"보유 {len(rows)}종목 · 손실 {thr}% 이하 {len(distressed)}종목"
+            + (" · 신규 매수 보류" if distressed else "")
+        ),
+    }
+
+
 def _evaluate_positions() -> None:
     positions = _get_all_positions()
     if not positions:
@@ -2291,6 +2860,7 @@ def _evaluate_positions() -> None:
 
 
 def _pending_reserved_slot_ids() -> set[str]:
+    from slot_registry import SLOT_STATUS_LOCKED
     from trading_categories import migrate_legacy_slot_uid
 
     reserved: set[str] = set()
@@ -2304,17 +2874,37 @@ def _pending_reserved_slot_ids() -> set[str]:
             uid = migrate_legacy_slot_uid(raw) or raw
             if uid:
                 reserved.add(uid)
+    for entry in trade_state.get_slots_book().values():
+        if str(entry.get("status") or "") == SLOT_STATUS_LOCKED:
+            uid = str(entry.get("slot_uid") or "").strip()
+            if uid:
+                reserved.add(uid)
     return reserved
 
 
 def _resolve_buy_slot_id(pick: dict[str, Any]) -> str | None:
     """타입 일치 empty slot_uid — long_term / swing / day_trading."""
-    from slot_registry import find_empty_slot_for_mode, is_slot_empty
+    from slot_registry import (
+        find_empty_slot_for_mode,
+        is_slot_empty,
+        is_slot_locked_for_code,
+    )
     from trading_categories import migrate_legacy_slot_uid
 
     slots = trade_state.get_slots_book()
     reserved = _pending_reserved_slot_ids()
     mode = pick.get("trading_mode") or pick.get("selected_trading_mode")
+    code = normalize_code(pick.get("code"))
+    force_uid = str(
+        pick.get("force_slot_uid") or pick.get("slot_uid") or ""
+    ).strip()
+    if pick.get("slot_lock_reserved") and force_uid:
+        uid = migrate_legacy_slot_uid(force_uid) or force_uid
+        if uid in slots and (
+            is_slot_locked_for_code(slots, uid, code)
+            or is_slot_empty(slots, uid)
+        ):
+            return uid
     preferred = pick.get("slot_uid") or migrate_legacy_slot_uid(pick.get("slot_id"))
     ui_idx = pick.get("ui_slot_index")
     sid = find_empty_slot_for_mode(
@@ -2448,22 +3038,31 @@ def _execute_pick_entry(token: str, pick: dict[str, Any]) -> dict[str, Any] | No
         config, "SCALP_USE_MARKET_ORDER", True
     )
     if use_market:
-        result = buy_market_order(
-            token, pick["code"], qty, config.APP_KEY, config.APP_SECRET
-        )
+        try:
+            result = buy_market_order(
+                token, pick["code"], qty, config.APP_KEY, config.APP_SECRET
+            )
+        except Exception as exc:
+            raise RuntimeError(f"매수 주문 실패: {exc}") from exc
     elif getattr(config, "SWING_USE_LIMIT_AT_CURRENT", True):
-        result = buy_limit_order(
-            token,
-            pick["code"],
-            qty,
-            pick["price"],
-            config.APP_KEY,
-            config.APP_SECRET,
-        )
+        try:
+            result = buy_limit_order(
+                token,
+                pick["code"],
+                qty,
+                pick["price"],
+                config.APP_KEY,
+                config.APP_SECRET,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"매수 주문 실패: {exc}") from exc
     else:
-        result = buy_market_order(
-            token, pick["code"], qty, config.APP_KEY, config.APP_SECRET
-        )
+        try:
+            result = buy_market_order(
+                token, pick["code"], qty, config.APP_KEY, config.APP_SECRET
+            )
+        except Exception as exc:
+            raise RuntimeError(f"매수 주문 실패: {exc}") from exc
 
     mode_tag = pick.get("mode_label", "스윙")
     bet_tag = bet_plan.get("label", "")
@@ -2552,6 +3151,301 @@ def _enqueue_intent(intent: dict[str, Any]) -> dict[str, Any]:
     return order
 
 
+def diagnose_pick_entry_checklist(
+    pick: dict[str, Any],
+    *,
+    token: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    매수 큐 진입(_enqueue_pick_entry) 체크리스트 — 단계별 통과/차단 사유.
+    후보는 있는데 매수가 안 될 때 어느 게이트에서 막히는지 진단용.
+    """
+    from slot_registry import display_idx_for_slot_uid, slot_spec
+    from trading_categories import normalize_trading_category
+    from trading_logic import passes_polling_entry_ma_filter
+
+    steps: list[dict[str, Any]] = []
+    code = normalize_code(pick.get("code"))
+    name = str(pick.get("name") or code)
+
+    def _step(step: str, ok: bool, detail: str = "") -> None:
+        steps.append({"step": step, "ok": ok, "detail": detail})
+
+    if len(code) != 6:
+        _step("valid_code", False, f"코드 '{code}' — 6자리 아님")
+        return steps
+    _step("valid_code", True, code)
+
+    if _is_code_order_pending(code, {"buy"}):
+        _step("no_pending_buy", False, f"{name}({code}) 매수 주문 대기 중")
+        return steps
+    _step("no_pending_buy", True)
+
+    if code in _get_held_codes():
+        _step("not_already_held", False, f"{name}({code}) 이미 보유")
+        return steps
+    _step("not_already_held", True)
+
+    if not is_common_stock_for_trade(pick):
+        _step("common_stock", False, f"{name}({code}) 일반주 아님")
+        return steps
+    _step("common_stock", True)
+
+    estimate = _estimate_buy_intent(pick)
+    prepared_pick = dict(estimate.get("pick") or pick)
+    budget_won = int(estimate.get("budget_won") or 0)
+    qty = int(estimate.get("quantity") or 0)
+    bet_plan = dict(estimate.get("bet_plan") or {})
+    price = int(prepared_pick.get("price") or 0)
+    if budget_won <= 0:
+        _step(
+            "bet_budget",
+            False,
+            bet_plan.get("label") or f"가용 시드 부족 (budget={budget_won:,})",
+        )
+        return steps
+    if qty < 1 or price <= 0:
+        _step(
+            "bet_quantity",
+            False,
+            f"수량 0 — price={price:,}, budget={budget_won:,}",
+        )
+        return steps
+    _step(
+        "bet_budget",
+        True,
+        f"{bet_plan.get('label', '베팅 OK')} · {qty}주 @ {price:,}원",
+    )
+
+    slot_uid = _resolve_buy_slot_id(prepared_pick)
+    if not slot_uid:
+        mode = prepared_pick.get("trading_mode") or prepared_pick.get("selected_trading_mode")
+        empty_n = _empty_slots()
+        empty_mode = _empty_slots(trading_mode=str(mode)) if mode else empty_n
+        _step(
+            "empty_slot",
+            False,
+            f"빈 슬롯 없음 (전체 {empty_n}, 모드={mode or '-'} → {empty_mode})",
+        )
+        return steps
+    _step("empty_slot", True, f"slot_uid={slot_uid}")
+
+    slots = trade_state.get_slots_book()
+    spec = slot_spec(slot_uid, slots) or {}
+    cat = normalize_trading_category(
+        spec.get("slot_personality") or spec.get("slot_type") or prepared_pick.get("trading_mode")
+    )
+    prepared_pick = _apply_trading_mode_override(prepared_pick, cat, fallback=cat)
+
+    if is_polling_strategy_mode():
+        if cat == "day_trading" and getattr(config, "POLLING_DISABLE_DAY_TRADING", True):
+            _step("polling_day_trading", False, "폴링 모드 — 단타 슬롯 진입 비활성")
+            return steps
+        _step("polling_day_trading", True, "단타 비활성 아님 또는 비단타 슬롯")
+        try:
+            tok = token or get_access_token()
+            daily = _get_daily_bars_cached(tok, code)
+            if not passes_polling_entry_ma_filter(cat, daily):
+                _step(
+                    "polling_ma_filter",
+                    False,
+                    f"폴링 MA 미충족 (mode={cat}, bars={len(daily or ())})",
+                )
+                return steps
+            _step("polling_ma_filter", True, f"MA 필터 통과 (mode={cat})")
+        except Exception as exc:
+            _step("polling_ma_filter", False, f"MA 검증 예외: {exc}")
+            return steps
+    else:
+        _step("polling_ma_filter", True, "실시간 모드 — MA 필터 스킵")
+
+    if getattr(config, "ML_STOP_LOSS_ENABLED", True):
+        try:
+            from ml_stop_loss.predictor import evaluate_ml_buy_guard
+
+            ml_result = evaluate_ml_buy_guard(
+                prepared_pick,
+                token=token or get_access_token(),
+                log=False,
+            )
+            detail = str(ml_result.get("detail") or "")
+            if ml_result.get("reject"):
+                _step(
+                    "ml_stop_loss",
+                    False,
+                    f"[AI 가드] 위험 신호 감지: 매수 보류 — {detail}",
+                )
+                return steps
+            if ml_result.get("prob") is not None:
+                _step("ml_stop_loss", True, detail)
+            else:
+                _step("ml_stop_loss", True, detail or "ML 게이트 스킵")
+        except Exception as exc:
+            _step("ml_stop_loss", True, f"ML 게이트 스킵 (예외: {exc})")
+    else:
+        _step("ml_stop_loss", True, "ML 손절 게이트 비활성")
+
+    _step("enqueue_ready", True, f"{name}({code}) → 슬롯 {slot_uid} 주문 큐 가능")
+    return steps
+
+
+def _log_manual_buy_checklist(
+    pick: dict[str, Any],
+    *,
+    context: str,
+    token: str | None = None,
+) -> list[dict[str, Any]]:
+    """수동 매수 — 체크리스트 전 단계를 무조건 INFO 로그."""
+    code = normalize_code(pick.get("code"))
+    name = str(pick.get("name") or code)
+    checklist = diagnose_pick_entry_checklist(pick, token=token)
+    lines = [
+        f"  [{'OK' if s.get('ok') else 'NG'}] {s.get('step')}: {s.get('detail', '')}"
+        for s in checklist
+    ]
+    failed = [s for s in checklist if not s.get("ok")]
+    logger.info(
+        "[handle_manual_buy] %s — %s(%s) checklist (%d steps, %d fail)\n%s",
+        context,
+        name,
+        code,
+        len(checklist),
+        len(failed),
+        "\n".join(lines) if lines else "  (empty)",
+    )
+    return checklist
+
+
+def _enqueue_pick_entry_debug_force(
+    pick: dict[str, Any],
+    *,
+    source: str,
+    entry_basis: str,
+    slot_idx: int | None = None,
+) -> dict[str, Any] | None:
+    """
+    디버그 — _enqueue_pick_entry 게이트(MA·bet_quantity 등) 우회 후 주문 큐 강제 적재.
+    MANUAL_BUY_DEBUG_FORCE_QUEUE=True 일 때만 사용.
+    """
+    from slot_registry import display_idx_for_slot_uid, find_empty_slot_for_mode, slot_spec
+    from trading_categories import normalize_trading_category
+
+    logger.warning(
+        "[MANUAL_BUY_DEBUG] force queue — MA/수량 게이트 우회 source=%s code=%s",
+        source,
+        pick.get("code"),
+    )
+    pick = _lock_ui_trading_mode(dict(pick))
+    if slot_idx is not None and int(slot_idx) > 0:
+        pick["ui_slot_index"] = int(slot_idx)
+        pick["ui_mode_locked"] = True
+
+    code = normalize_code(pick.get("code"))
+    if len(code) != 6:
+        logger.error("[MANUAL_BUY_DEBUG] invalid code %s", code)
+        return None
+    if code in _get_held_codes():
+        logger.error("[MANUAL_BUY_DEBUG] already held %s", code)
+        return None
+
+    token = get_access_token()
+    quote = _quote_price(token, code)
+    pick["code"] = code
+    pick["name"] = resolve_stock_name(code, pick.get("name") or quote.get("name"), access_token=token)
+    pick["price"] = int(quote.get("price") or pick.get("price") or pick.get("current_price") or 0)
+    if not pick.get("raw_code"):
+        pick["raw_code"] = f"A{code}"
+
+    estimate = _estimate_buy_intent(pick)
+    prepared_pick = dict(estimate.get("pick") or pick)
+    price = int(prepared_pick.get("price") or 0)
+    force_qty = max(1, int(getattr(config, "MANUAL_BUY_DEBUG_FORCE_QTY", 1)))
+    qty = max(int(estimate.get("quantity") or 0), force_qty)
+    budget_won = int(estimate.get("budget_won") or 0)
+    if budget_won <= 0 and price > 0:
+        budget_won = price * qty
+        logger.warning(
+            "[MANUAL_BUY_DEBUG] budget was 0 — using price*qty=%s",
+            budget_won,
+        )
+
+    if prepared_pick.get("slot_lock_reserved") and prepared_pick.get("force_slot_uid"):
+        slot_uid = str(prepared_pick.get("force_slot_uid") or prepared_pick.get("slot_uid") or "")
+    else:
+        slot_uid = _resolve_buy_slot_id(prepared_pick)
+        if not slot_uid and slot_idx:
+            mode = prepared_pick.get("trading_mode") or prepared_pick.get("selected_trading_mode")
+            slot_uid = find_empty_slot_for_mode(
+                trade_state.get_slots_book(),
+                mode,
+                preferred_display_idx=int(slot_idx),
+            )
+    if not slot_uid:
+        logger.error("[MANUAL_BUY_DEBUG] no empty slot for %s", code)
+        return None
+
+    slots = trade_state.get_slots_book()
+    spec = slot_spec(slot_uid, slots) or {}
+    cat = normalize_trading_category(
+        spec.get("slot_personality") or spec.get("slot_type") or prepared_pick.get("trading_mode")
+    )
+    prepared_pick = _apply_trading_mode_override(prepared_pick, cat, fallback=cat)
+    prepared_pick["slot_uid"] = slot_uid
+    prepared_pick["slot_id"] = cat
+    prepared_pick["debug_force_buy"] = True
+    ui_idx = display_idx_for_slot_uid(slot_uid)
+    if ui_idx:
+        prepared_pick["ui_slot_index"] = ui_idx
+
+    bet_plan = dict(estimate.get("bet_plan") or {})
+    bet_plan["label"] = f"{bet_plan.get('label', '')} · DEBUG force".strip(" ·")
+
+    intent = {
+        "action": "buy",
+        "code": code,
+        "name": prepared_pick.get("name") or code,
+        "pick": prepared_pick,
+        "source": source,
+        "entry_basis": entry_basis,
+        "budget_won": budget_won,
+        "quantity": qty,
+        "bet_plan": bet_plan,
+        "trading_mode": prepared_pick.get("trading_mode"),
+        "mode_label": prepared_pick.get("mode_label"),
+        "baseline_qty": 0,
+        "slot_uid": slot_uid,
+        "slot_id": cat,
+        "message": "DEBUG force buy — 주문 접수 대기",
+    }
+    logger.info(
+        "[MANUAL_BUY_DEBUG] enqueue %s(%s) qty=%d budget=%s slot=%s mode=%s",
+        prepared_pick.get("name"),
+        code,
+        qty,
+        f"{budget_won:,}",
+        slot_uid,
+        cat,
+    )
+    return _enqueue_intent(intent)
+
+
+def _log_pick_entry_checklist(pick: dict[str, Any], *, context: str) -> None:
+    code = normalize_code(pick.get("code"))
+    name = str(pick.get("name") or code)
+    checklist = diagnose_pick_entry_checklist(pick)
+    failed = [s for s in checklist if not s.get("ok")]
+    if not failed:
+        return
+    lines = [f"  · {s['step']}: {s.get('detail') or 'FAIL'}" for s in failed]
+    logger.info(
+        "[매수체크리스트] %s — %s(%s) 차단\n%s",
+        context,
+        name,
+        code,
+        "\n".join(lines),
+    )
+
+
 def _enqueue_pick_entry(
     pick: dict[str, Any],
     *,
@@ -2583,23 +3477,56 @@ def _enqueue_pick_entry(
     if ui_idx:
         prepared_pick["ui_slot_index"] = ui_idx
 
+    entry_basis_val = str(
+        prepared_pick.get("entry_basis") or entry_basis or ""
+    ).strip()
+    entry_track = str(prepared_pick.get("entry_track") or "").strip()
+    skip_ma_filter = entry_basis_val in (
+        "ma_convergence",
+        "morning_disparity_breakout",
+    ) or entry_track in ("convergence", "morning_scalp")
+    morning_scalp_pick = (
+        entry_track == "morning_scalp"
+        or entry_basis_val == "morning_disparity_breakout"
+    )
+
     if is_polling_strategy_mode():
         if cat == "day_trading" and getattr(config, "POLLING_DISABLE_DAY_TRADING", True):
-            logger.info("폴링 모드 — 단타 슬롯 진입 스킵 %s", code)
-            return None
+            if not (
+                morning_scalp_pick
+                and getattr(config, "POLLING_ENABLE_MORNING_SCALP", True)
+            ):
+                logger.info("폴링 모드 — 단타 슬롯 진입 스킵 %s", code)
+                return None
+        if not skip_ma_filter:
+            try:
+                token = get_access_token()
+                daily = _get_daily_bars_cached(token, code)
+                if not passes_polling_entry_ma_filter(cat, daily):
+                    logger.info(
+                        "폴링 MA 미충족 — 진입 스킵 %s (%s)",
+                        code,
+                        prepared_pick.get("name") or code,
+                    )
+                    return None
+            except Exception as exc:
+                logger.warning("폴링 MA 검증 실패 %s: %s", code, exc)
+                return None
+
+    if getattr(config, "ML_STOP_LOSS_ENABLED", True):
         try:
-            token = get_access_token()
-            daily = _get_daily_bars_cached(token, code)
-            if not passes_polling_entry_ma_filter(cat, daily):
-                logger.info(
-                    "폴링 MA 미충족 — 진입 스킵 %s (%s)",
-                    code,
-                    prepared_pick.get("name") or code,
-                )
+            from ml_stop_loss.predictor import evaluate_ml_buy_guard
+
+            ml_result = evaluate_ml_buy_guard(
+                prepared_pick,
+                token=get_access_token(),
+                log=True,
+            )
+            _record_ml_guard_alert(ml_result)
+            if ml_result.get("reject"):
                 return None
         except Exception as exc:
-            logger.warning("폴링 MA 검증 실패 %s: %s", code, exc)
-            return None
+            logger.warning("[AI 가드] ML 게이트 예외 %s: %s", code, exc)
 
     intent = {
         "action": "buy",
@@ -2636,7 +3563,14 @@ def _enqueue_sell_order(
         return None
     qty_all = int(pos.get("quantity") or 0)
     sell_qty = qty_all
-    if "장투 6월 작전 분할청산" in str(reason):
+    if "패닉 손절" in str(reason):
+        frac = float(getattr(config, "PANIC_STOP_SELL_FRACTION", 0.5))
+        stage = int(pos.get("panic_stop_stage") or 0)
+        if frac >= 1.0 or stage >= 1 or qty_all <= 1:
+            sell_qty = qty_all
+        else:
+            sell_qty = max(1, qty_all // 2)
+    elif "장투 6월 작전 분할청산" in str(reason):
         total_tranches = max(1, int(getattr(config, "LONG_FORCE_SPLIT_TRANCHES", 5)))
         done = int(pos.get("long_force_exit_stage") or 0)
         remaining_tranches = max(1, total_tranches - done)
@@ -2644,6 +3578,15 @@ def _enqueue_sell_order(
             sell_qty = qty_all
         else:
             sell_qty = max(1, qty_all // remaining_tranches)
+    elif "분할 익절" in str(reason):
+        stage = int(pos.get("quick_half_profit_stage") or 0)
+        frac = float(getattr(config, "QUICK_HALF_PROFIT_FRACTION", 0.5))
+        if stage >= 1 or qty_all <= 1 or frac >= 1.0:
+            sell_qty = qty_all
+        else:
+            sell_qty = max(1, qty_all // 2) if frac <= 0.5 else max(
+                1, int(round(qty_all * frac))
+            )
     intent = {
         "action": "sell",
         "code": norm,
@@ -2687,103 +3630,115 @@ def _enqueue_pyramid_order(code: str, plan: dict[str, Any]) -> dict[str, Any] | 
 
 def _order_worker_loop() -> None:
     while True:
-        item = _order_queue.get()
-        ticket_id = str(item.get("ticket_id") or "")
-        with _orders_lock:
-            order = dict(_orders.get(ticket_id) or {})
-        if not order:
-            _order_queue.task_done()
-            continue
-
+        ticket_id = ""
+        order: dict[str, Any] = {}
+        got_item = False
         try:
-            _update_order_state(ticket_id, status="submitting", message="주문 제출 중")
-            with order_priority_lane():
-                token = get_access_token()
-                action = str(order.get("action"))
-                if action == "buy":
-                    submitted = _execute_pick_entry(
-                        token,
-                        dict(
-                            order.get("payload", {}).get("pick")
-                            or order.get("pick")
-                            or {}
-                        ),
-                    )
-                    if not submitted:
-                        raise RuntimeError("가용 시드가 부족하거나 주문 수량이 없습니다.")
-                    _update_order_state(
-                        ticket_id,
-                        status="pending_fill",
-                        message=str(submitted["message"]),
-                        broker_order_no=str(submitted["order"].get("order_no") or ""),
-                        quantity=int(submitted["quantity"]),
-                        budget_won=int(submitted["budget_won"]),
-                        pick=dict(submitted["pick"]),
-                        bet_plan=dict(submitted["bet_plan"]),
-                        reference_price=int(submitted.get("reference_price") or 0),
-                        name=submitted["pick"].get("name") or order.get("name"),
-                    )
-                elif action == "sell":
-                    submitted = _submit_exit_order(
-                        token,
-                        dict(
-                            order.get("payload", {}).get("position")
-                            or order.get("position")
-                            or {}
-                        ),
-                        reason=str(order.get("reason") or "비동기 매도"),
-                        prefer_market=bool(
-                            order.get("payload", {}).get("prefer_market")
-                            or order.get("prefer_market")
-                        ),
-                    )
-                    _update_order_state(
-                        ticket_id,
-                        status="pending_fill",
-                        message=f"{order.get('reason') or '매도'} 주문 접수",
-                        broker_order_no=str(submitted["result"].get("order_no") or ""),
-                        estimated_fill_price=int(submitted["estimate_exit_price"]),
-                        quantity=int(submitted["quantity"]),
-                    )
-                elif action == "pyramid_buy":
-                    submitted = _submit_pyramid_order(
-                        token,
-                        dict(
-                            order.get("payload", {}).get("position")
-                            or order.get("position")
-                            or {}
-                        ),
-                        dict(
-                            order.get("payload", {}).get("pyramid_plan")
-                            or order.get("pyramid_plan")
-                            or {}
-                        ),
-                    )
-                    _update_order_state(
-                        ticket_id,
-                        status="pending_fill",
-                        message="피라미딩 주문 접수",
-                        broker_order_no=str(submitted["result"].get("order_no") or ""),
-                        quantity=int(submitted["quantity"]),
-                        budget_won=int(submitted["budget_won"]),
-                        reference_price=int(submitted["reference_price"]),
-                    )
+            item = _order_queue.get()
+            got_item = True
+            ticket_id = str(item.get("ticket_id") or "")
+            with _orders_lock:
+                order = dict(_orders.get(ticket_id) or {})
+            if not order:
+                continue
+
+            try:
+                _update_order_state(ticket_id, status="submitting", message="주문 제출 중")
+                with order_priority_lane():
+                    token = get_access_token()
+                    action = str(order.get("action"))
+                    if action == "buy":
+                        submitted = _execute_pick_entry(
+                            token,
+                            dict(
+                                order.get("payload", {}).get("pick")
+                                or order.get("pick")
+                                or {}
+                            ),
+                        )
+                        if not submitted:
+                            raise RuntimeError(
+                                "가용 시드가 부족하거나 주문 수량이 없습니다."
+                            )
+                        _update_order_state(
+                            ticket_id,
+                            status="pending_fill",
+                            message=str(submitted["message"]),
+                            broker_order_no=str(submitted["order"].get("order_no") or ""),
+                            quantity=int(submitted["quantity"]),
+                            budget_won=int(submitted["budget_won"]),
+                            pick=dict(submitted["pick"]),
+                            bet_plan=dict(submitted["bet_plan"]),
+                            reference_price=int(submitted.get("reference_price") or 0),
+                            name=submitted["pick"].get("name") or order.get("name"),
+                        )
+                    elif action == "sell":
+                        submitted = _submit_exit_order(
+                            token,
+                            dict(
+                                order.get("payload", {}).get("position")
+                                or order.get("position")
+                                or {}
+                            ),
+                            reason=str(order.get("reason") or "비동기 매도"),
+                            prefer_market=bool(
+                                order.get("payload", {}).get("prefer_market")
+                                or order.get("prefer_market")
+                            ),
+                        )
+                        _update_order_state(
+                            ticket_id,
+                            status="pending_fill",
+                            message=f"{order.get('reason') or '매도'} 주문 접수",
+                            broker_order_no=str(submitted["result"].get("order_no") or ""),
+                            estimated_fill_price=int(submitted["estimate_exit_price"]),
+                            quantity=int(submitted["quantity"]),
+                        )
+                    elif action == "pyramid_buy":
+                        submitted = _submit_pyramid_order(
+                            token,
+                            dict(
+                                order.get("payload", {}).get("position")
+                                or order.get("position")
+                                or {}
+                            ),
+                            dict(
+                                order.get("payload", {}).get("pyramid_plan")
+                                or order.get("pyramid_plan")
+                                or {}
+                            ),
+                        )
+                        _update_order_state(
+                            ticket_id,
+                            status="pending_fill",
+                            message="피라미딩 주문 접수",
+                            broker_order_no=str(submitted["result"].get("order_no") or ""),
+                            quantity=int(submitted["quantity"]),
+                            budget_won=int(submitted["budget_won"]),
+                            reference_price=int(submitted["reference_price"]),
+                        )
+                    else:
+                        raise RuntimeError(f"지원하지 않는 주문 액션: {action}")
+            except Exception as exc:
+                if is_rate_limit_error(exc):
+                    msg = f"초당 제한: {exc}"
+                    logger.warning("주문 제출 속도제한 %s — %s", ticket_id, msg)
                 else:
-                    raise RuntimeError(f"지원하지 않는 주문 액션: {action}")
+                    logger.exception("주문 제출 실패 %s", ticket_id)
+                    msg = str(exc)
+                _finalize_and_drop_order(ticket_id, msg)
         except Exception as exc:
-            if is_rate_limit_error(exc):
-                _update_order_state(
-                    ticket_id,
-                    status="rejected",
-                    message="초당 제한으로 재시도 중... (실패)",
-                )
-            else:
-                logger.exception("주문 제출 실패 %s", ticket_id)
-                _update_order_state(ticket_id, status="rejected", message=str(exc))
-            _clear_position_order_pending(str(order.get("code")), ticket_id)
+            logger.exception("주문 워커 루프 오류 ticket=%s", ticket_id or "-")
+            if ticket_id:
+                _finalize_and_drop_order(ticket_id, str(exc))
         finally:
+            if got_item:
+                try:
+                    _order_queue.task_done()
+                except ValueError:
+                    pass
             _publish_order_snapshot()
-            _order_queue.task_done()
+            _wake_engine()
 
 
 def _poll_pending_orders_once() -> None:
@@ -2996,6 +3951,10 @@ def _run_market_scan_and_buy(*, force: bool = False) -> dict[str, Any]:
                 entry_basis=str(pick.get("entry_basis") or "scan_queue"),
             )
             if not order_info:
+                _log_pick_entry_checklist(
+                    pick,
+                    context="realtime_scan" if not force else "force_scan",
+                )
                 continue
             msg = (
                 f"[접수] {pick.get('name', pick['code'])}({pick['code']}) "
@@ -3074,9 +4033,13 @@ def _run_market_scan_and_buy(*, force: bool = False) -> dict[str, Any]:
 
 def _try_scan_and_buy() -> None:
     if not _begin_scan():
+        logger.debug("스캔 스킵 — 다른 스캔/주문 진행 중")
         return
     try:
         _run_market_scan_and_buy(force=False)
+    except Exception as exc:
+        logger.exception("시장 스캔/매수 루프 오류 — 다음 틱 재시도: %s", exc)
+        _mark_scan_completed(f"스캔 오류(복구): {exc}")
     finally:
         _end_scan()
 
@@ -3210,7 +4173,7 @@ def run_immediate_universe_scan() -> dict[str, Any]:
     _set_engine_mode("scanning")
     token = get_access_token()
     try:
-        ranked = _reload_universe_cache(token, refresh_ai=False)
+        ranked = _reload_universe_cache(token, refresh_ai=False, reason="boot_immediate_scan")
         logger.info("기동 즉시 스캔 — 유니버스 %d종목 (거래대금·AI 캐시 주기 준수)", len(ranked))
     except Exception as exc:
         logger.exception("기동 즉시 유니버스/AI 실패: %s", exc)
@@ -3256,7 +4219,7 @@ def force_market_scan_from_ui() -> dict[str, Any]:
     _last_scan_at = 0.0
     token = get_access_token()
     try:
-        _reload_universe_cache(token, refresh_ai=False)
+        _reload_universe_cache(token, refresh_ai=False, reason="ui_force_scan")
     except Exception as exc:
         logger.warning("F5 강제탐색 전 유니버스 갱신 실패: %s", exc)
     if not _begin_scan():
@@ -3434,6 +4397,11 @@ def _run_realtime_cycle() -> None:
     if polling:
         _polling_refresh_balance_if_due()
 
+    try:
+        _run_panic_stop_loss_loop()
+    except Exception as exc:
+        logger.exception("패닉 손절 루프 오류: %s", exc)
+
     need_poll_eval = positions and (polling or not ws_ok)
     if need_poll_eval:
         poll_interval = max(
@@ -3495,9 +4463,19 @@ def _realtime_engine_loop() -> None:
         _reset_daily_stats_if_needed()
         now_dt = datetime.now()
         _maybe_preopen_session_boot(now_dt)
-        _maybe_send_market_open_summary(now_dt)
-        _maybe_send_daily_close_summary(now_dt)
-        _maybe_send_daily_close_report(now_dt)
+        _maybe_reload_engine_config()
+        try:
+            _maybe_send_market_open_summary(now_dt)
+        except Exception as exc:
+            logger.exception("장시작 요약 스케줄 오류: %s", exc)
+        try:
+            _maybe_send_daily_close_summary(now_dt)
+        except Exception as exc:
+            logger.exception("장마감 결산 스케줄 오류: %s", exc)
+        try:
+            _maybe_send_daily_close_report(now_dt)
+        except Exception as exc:
+            logger.exception("장마감 리포트 스케줄 오류: %s", exc)
         now_t = now_dt.time()
         ws_ok = _realtime_ws_ready()
 
@@ -3526,9 +4504,11 @@ def _realtime_engine_loop() -> None:
             continue
 
         try:
+            _maybe_hard_refresh_if_watch_stale(now_dt)
             _run_realtime_cycle()
         except Exception as exc:
             logger.exception("실시간 엔진 틱 오류: %s", exc)
+            _force_engine_hard_refresh(f"엔진 틱 예외: {exc}")
 
         if ws_ok and not is_polling_strategy_mode():
             _engine_wake.wait(timeout=WS_ENGINE_WAIT_SEC)
@@ -3543,7 +4523,7 @@ def _realtime_engine_loop() -> None:
 
 
 def start_background_scheduler() -> None:
-    global _started, _engine_thread, _monitor_thread
+    global _started, _engine_thread, _monitor_thread, _last_engine_config_nonce
     with _start_lock:
         if _started:
             return
@@ -3551,6 +4531,11 @@ def start_background_scheduler() -> None:
         trade_state.ensure_positions_file()
         _load_positions_from_disk()
         _apply_trade_state_to_memory()
+        from bot_config_reload import init_config_mtime_baseline, start_config_watchdog
+
+        init_config_mtime_baseline()
+        _last_engine_config_nonce = trade_state.get_engine_config_reload_nonce()
+        start_config_watchdog()
         _engine_thread = threading.Thread(
             target=_realtime_engine_loop,
             name="realtime-rolling-engine",
@@ -3694,61 +4679,143 @@ def get_ui_universe_recommendations(limit: int = 40) -> list[dict[str, Any]]:
     return pick_brain_recommendations(_universe_cache, limit=max(0, int(limit)))
 
 
-def manual_buy_recommended_pick(
+def handle_manual_buy(
     candidate: dict[str, Any],
     *,
     slot_idx: int | None = None,
 ) -> dict[str, Any]:
-    """UI 추천 슬롯 반자동 진입."""
+    """
+    UI 「이 종목 매수」 버튼 핸들러 — 게이트별 로그 + (옵션) 디버그 강제 큐.
+    """
     completed_at = datetime.now().strftime("%H:%M:%S")
     code = normalize_code(candidate.get("code"))
+    name = str(candidate.get("name") or code)
+    logger.info(
+        "[handle_manual_buy] clicked slot=%s code=%s name=%s debug_force=%s",
+        slot_idx,
+        code,
+        name,
+        bool(getattr(config, "MANUAL_BUY_DEBUG_FORCE_QUEUE", False)),
+    )
+
     if len(code) != 6:
+        logger.info("[handle_manual_buy] REJECT valid_code — code=%r", code)
         return {"success": False, "message": "추천 종목 코드가 올바르지 않습니다."}
+
     if code in _get_held_codes():
+        logger.info("[handle_manual_buy] REJECT not_already_held — already held %s", code)
         return {"success": False, "message": "이미 보유 중인 종목입니다."}
-    if not (_is_weekday() and _in_scan_window(datetime.now().time())):
+
+    in_window = _is_weekday() and _in_scan_window(datetime.now().time())
+    skip_hours = bool(getattr(config, "MANUAL_BUY_DEBUG_SKIP_MARKET_HOURS", False))
+    if not in_window and not skip_hours:
+        logger.info(
+            "[handle_manual_buy] REJECT market_hours — weekday=%s in_window=%s",
+            _is_weekday(),
+            _in_scan_window(datetime.now().time()),
+        )
         return {"success": False, "message": "장중에만 수동 매수가 가능합니다."}
+    if not in_window and skip_hours:
+        logger.warning("[handle_manual_buy] DEBUG — 장외이나 MANUAL_BUY_DEBUG_SKIP_MARKET_HOURS 로 진행")
+
     if not _begin_scan():
+        logger.info("[handle_manual_buy] REJECT begin_scan — another scan/order in progress")
         return {"success": False, "message": "다른 스캔/주문이 진행 중입니다."}
 
+    locked_slot_uid: str | None = None
     try:
+        if slot_idx is None or int(slot_idx) <= 0:
+            logger.info("[handle_manual_buy] REJECT slot_idx — UI 슬롯 미지정")
+            return {
+                "success": False,
+                "message": "수동 매수는 UI 슬롯 번호가 필요합니다.",
+            }
+
         pick = dict(candidate)
-        if slot_idx is not None and int(slot_idx) > 0:
-            pick["ui_slot_index"] = int(slot_idx)
-            pick["ui_mode_locked"] = True
+        pick["ui_slot_index"] = int(slot_idx)
+        pick["ui_mode_locked"] = True
         pick = _lock_ui_trading_mode(pick)
+        pick["code"] = code
         selected_mode = str(
             pick.get("selected_trading_mode")
             or pick.get("trading_mode")
             or TradingMode.SWING.value
         )
-        if slot_idx is not None and int(slot_idx) > 0:
-            from slot_registry import slot_spec_for_display_idx, slot_type_matches
+        logger.info(
+            "[handle_manual_buy] mode=%s empty_slots(all)=%d empty_slots(mode)=%d slot_idx=%s",
+            selected_mode,
+            _empty_slots(),
+            _empty_slots(trading_mode=selected_mode),
+            slot_idx,
+        )
 
-            spec = slot_spec_for_display_idx(int(slot_idx), trade_state.get_slots_book())
-            sid = str(spec.get("slot_uid") or "") if spec else ""
-            if spec and not slot_type_matches(spec.get("slot_type"), selected_mode):
-                return {
-                    "success": False,
-                    "message": (
-                        f"슬롯 {slot_idx}({spec.get('slot_id')})는 "
-                        f"{spec.get('slot_type')} 전용입니다. 다른 타입 종목은 배치할 수 없습니다."
-                    ),
-                }
-        if _empty_slots(trading_mode=selected_mode) <= 0:
+        from portfolio_manager import (
+            PortfolioSlotError,
+            atomic_lock_slot_for_manual_buy,
+            flush_portfolio_state_for_ui,
+            release_slot_lock_by_uid,
+        )
+
+        try:
+            lock_result = atomic_lock_slot_for_manual_buy(
+                display_idx=int(slot_idx),
+                code=code,
+                name=name,
+                trading_mode=selected_mode,
+                pick=pick,
+            )
+        except PortfolioSlotError as exc:
+            logger.info("[handle_manual_buy] REJECT slot_lock — %s", exc)
+            return {"success": False, "message": str(exc)}
+
+        locked_slot_uid = str(lock_result.get("slot_uid") or "")
+        pick = dict(lock_result.get("pick") or pick)
+        _apply_runtime_positions_from_store()
+        _sync_positions_state()
+
+        token = get_access_token()
+        checklist = _log_manual_buy_checklist(pick, context="before_enqueue", token=token)
+        failed_steps = [s["step"] for s in checklist if not s.get("ok")]
+
+        debug_force = bool(getattr(config, "MANUAL_BUY_DEBUG_FORCE_QUEUE", False))
+        if debug_force:
+            order_info = _enqueue_pick_entry_debug_force(
+                pick,
+                source="manual_slot_buy_debug",
+                entry_basis="ui_manual_pick_debug",
+                slot_idx=slot_idx,
+            )
+        else:
+            order_info = _enqueue_pick_entry(
+                pick,
+                source="manual_slot_buy",
+                entry_basis="ui_manual_pick",
+            )
+            if not order_info:
+                _log_pick_entry_checklist(pick, context="manual_slot_buy_failed")
+
+        if not order_info:
+            if locked_slot_uid:
+                release_slot_lock_by_uid(locked_slot_uid, code=code)
+                _apply_runtime_positions_from_store()
+                _sync_positions_state()
+            detail = ", ".join(failed_steps) if failed_steps else "enqueue returned None"
+            logger.info("[handle_manual_buy] REJECT enqueue — %s", detail)
             return {
                 "success": False,
-                "message": f"{selected_mode} 타입 빈 슬롯이 없습니다.",
+                "message": f"주문 큐 진입 실패 ({detail})",
+                "failed_steps": failed_steps,
+                "checklist": checklist,
             }
+
+        flush_portfolio_state_for_ui(reason=f"manual_buy_queued:{code}")
         selected_label = _mode_tags_for_value(selected_mode)["mode_label"]
-        order_info = _enqueue_pick_entry(
-            pick,
-            source="manual_slot_buy",
-            entry_basis="ui_manual_pick",
+        debug_tag = " [DEBUG force]" if debug_force else ""
+        msg = (
+            f"슬롯 {slot_idx} Lock · {selected_label}{debug_tag} · "
+            f"주문 티켓 {order_info['ticket_id']} 접수"
         )
-        if not order_info:
-            return {"success": False, "message": "가용 시드가 부족하거나 중복 주문 대기 중입니다."}
-        msg = f"{selected_label} · 주문 티켓 {order_info['ticket_id']} 접수"
+        logger.info("[handle_manual_buy] OK — %s", msg)
         _record_job_success(f"수동 진입 접수 · {msg}")
         _mark_scan_completed(f"수동 진입 접수 · {msg}")
         _wake_engine()
@@ -3759,10 +4826,13 @@ def manual_buy_recommended_pick(
             "watch_hms": get_recent_watch_hms(),
             "ticket_id": order_info["ticket_id"],
             "mode_label": selected_label,
+            "debug_force": debug_force,
+            "slot_uid": locked_slot_uid,
+            "slot_idx": int(slot_idx),
         }
     except Exception as exc:
         _record_job_failure(exc)
-        logger.exception("UI 수동 매수 실패")
+        logger.exception("[handle_manual_buy] exception")
         return {
             "success": False,
             "message": str(exc),
@@ -3770,6 +4840,15 @@ def manual_buy_recommended_pick(
         }
     finally:
         _end_scan()
+
+
+def manual_buy_recommended_pick(
+    candidate: dict[str, Any],
+    *,
+    slot_idx: int | None = None,
+) -> dict[str, Any]:
+    """UI 추천 슬롯 반자동 진입 — handle_manual_buy 위임."""
+    return handle_manual_buy(candidate, slot_idx=slot_idx)
 
 
 def preview_manual_pick_entry(

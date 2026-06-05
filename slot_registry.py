@@ -36,6 +36,9 @@ DEFAULT_SLOT_DEFINITIONS: list[dict[str, Any]] = [
 
 SLOT_PORTFOLIO_SCHEMA = "slot_portfolio_v2"
 SLOT_PORTFOLIO_SCHEMA_V1 = "slot_portfolio_v1"
+SLOT_STATUS_EMPTY = "empty"
+SLOT_STATUS_FILLED = "filled"
+SLOT_STATUS_LOCKED = "locked"
 
 
 def slot_definitions() -> list[dict[str, Any]]:
@@ -75,7 +78,8 @@ def slot_entry_mode(entry: dict[str, Any]) -> str:
 def is_position_assigned_in_slots(slots: dict[str, dict[str, Any]], code: str) -> bool:
     norm = str(code or "").strip()
     for entry in slots.values():
-        if str(entry.get("status") or "empty") != "filled":
+        status = str(entry.get("status") or SLOT_STATUS_EMPTY)
+        if status not in (SLOT_STATUS_FILLED, SLOT_STATUS_LOCKED):
             continue
         if str(entry.get("code") or "") == norm:
             return True
@@ -88,6 +92,135 @@ def find_any_empty_slot(slots: dict[str, dict[str, Any]]) -> str | None:
         if str(entry.get("status") or "empty") == "empty":
             return str(entry.get("slot_uid"))
     return None
+
+
+def _resolve_mode_from_config(
+    display_idx: int,
+    *,
+    code: str | None = None,
+    slot_uid: str | None = None,
+    fallback: object = None,
+) -> str:
+    """
+    Config 우선 모드 — selected_modes.json → slots_config.json → fallback.
+    positions_state.json 에 박힌 trading_mode 는 fallback 으로만 사용.
+    """
+    import selected_modes
+
+    mode = normalize_trading_category(
+        selected_modes.resolve_mode_value_for_slot(
+            display_idx if int(display_idx or 0) > 0 else None,
+            code=code,
+            fallback_value=None,
+        )
+    )
+    sk = selected_modes.slot_storage_key(display_idx) if int(display_idx or 0) > 0 else ""
+    modes = selected_modes.load_modes()
+    has_slot_key = bool(sk and modes.get(sk))
+    has_code_key = bool(
+        code and len(str(code).strip()) == 6 and modes.get(str(code).strip())
+    )
+    if has_slot_key or has_code_key:
+        return mode
+
+    try:
+        from bot_config_reload import resolve_mode_from_slots_config
+
+        cfg = resolve_mode_from_slots_config(
+            display_idx,
+            slot_uid=slot_uid,
+            code=code,
+        )
+        if cfg:
+            return normalize_trading_category(cfg)
+    except ImportError:
+        pass
+
+    if fallback is not None:
+        return normalize_trading_category(fallback)
+    return mode
+
+
+def apply_config_to_portfolio_state(
+    positions: dict[str, dict[str, Any]],
+    slots: dict[str, dict[str, Any]],
+    *,
+    recalc_targets: bool = False,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """
+    기동·재로드 — Config(selected_modes + slots_config) 로 slots·positions 모드 덮어쓰기.
+    positions_state 는 수량·평단 등 보유 데이터만 유지.
+    """
+    import selected_modes
+
+    selected_modes.load_modes()
+
+    pos_copy = {str(k): dict(v) for k, v in positions.items() if isinstance(v, dict)}
+    book = normalize_slots_book(slots)
+
+    for uid, entry in book.items():
+        if not isinstance(entry, dict):
+            continue
+        display_idx = int(entry.get("display_idx") or 0)
+        code = str(entry.get("code") or "").strip() or None
+        mode = _resolve_mode_from_config(
+            display_idx,
+            code=code if code and len(code) == 6 else None,
+            slot_uid=uid,
+            fallback=entry.get("slot_personality"),
+        )
+        entry.update(_personality_fields(mode))
+        book[uid] = entry
+
+    sync_slots_with_positions(book, pos_copy)
+
+    code_to_uid: dict[str, str] = {}
+    for uid, entry in book.items():
+        if str(entry.get("status") or "empty") != "filled":
+            continue
+        c = str(entry.get("code") or "").strip()
+        if c:
+            code_to_uid[c] = uid
+
+    for code, pos in pos_copy.items():
+        norm = str(code).strip()
+        uid = str(pos.get("slot_uid") or "").strip() or code_to_uid.get(norm, "")
+        entry = book.get(uid) if uid else None
+        display_idx = int(
+            (entry or {}).get("display_idx")
+            or pos.get("display_idx")
+            or 0
+        )
+        if entry:
+            mode = slot_entry_mode(entry)
+        else:
+            mode = _resolve_mode_from_config(
+                display_idx,
+                code=norm,
+                slot_uid=uid or None,
+                fallback=pos.get("trading_mode"),
+            )
+        if uid:
+            _apply_position_slot_meta(pos, uid, mode)
+        else:
+            pos["trading_mode"] = mode
+            pos["slot_type"] = mode
+            pos["slot_id"] = mode
+            pos["slot_personality"] = mode
+
+        if recalc_targets:
+            try:
+                from trading_logic import (
+                    apply_tactical_fields_on_position,
+                    refresh_target_live_fields,
+                )
+
+                apply_tactical_fields_on_position(pos)
+                refresh_target_live_fields(pos, force_recalc=True)
+            except ImportError:
+                pass
+
+    return pos_copy, book
 
 
 def _apply_position_slot_meta(
@@ -184,14 +317,20 @@ def normalize_slots_book(raw: dict[str, Any] | None) -> dict[str, dict[str, Any]
         merged = dict(book[uid])
         merged.update(entry)
         merged["slot_uid"] = uid
-        pers = normalize_trading_category(
-            merged.get("slot_personality")
-            or merged.get("slot_id")
-            or merged.get("slot_type")
-            or book[uid].get("slot_type")
+        display_idx = int(merged.get("display_idx") or book[uid]["display_idx"])
+        code = str(merged.get("code") or "").strip() or None
+        pers = _resolve_mode_from_config(
+            display_idx,
+            code=code if code and len(code) == 6 else None,
+            slot_uid=uid,
+            fallback=(
+                merged.get("slot_personality")
+                or merged.get("slot_id")
+                or merged.get("slot_type")
+            ),
         )
         merged.update(_personality_fields(pers))
-        merged["display_idx"] = int(merged.get("display_idx") or book[uid]["display_idx"])
+        merged["display_idx"] = display_idx
         status = str(merged.get("status") or "empty").lower()
         merged["status"] = "filled" if status == "filled" else "empty"
         code = merged.get("code")
@@ -369,19 +508,81 @@ def find_empty_slot_for_mode(
     if preferred and preferred in slots:
         entry = slots[str(preferred)]
         if (
-            str(entry.get("status") or "empty") == "empty"
+            str(entry.get("status") or SLOT_STATUS_EMPTY) == SLOT_STATUS_EMPTY
             and slot_type_matches(slot_entry_mode(entry), mode_type)
         ):
             return str(preferred)
 
     ordered = sorted(slots.values(), key=lambda e: int(e.get("display_idx") or 0))
     for entry in ordered:
-        if str(entry.get("status") or "empty") != "empty":
+        if str(entry.get("status") or SLOT_STATUS_EMPTY) != SLOT_STATUS_EMPTY:
             continue
         if not slot_type_matches(slot_entry_mode(entry), mode_type):
             continue
         return str(entry.get("slot_uid"))
     return None
+
+
+def is_slot_lockable(slots: dict[str, dict[str, Any]], slot_uid: str) -> bool:
+    uid = migrate_legacy_slot_uid(slot_uid) or str(slot_uid)
+    entry = slots.get(uid)
+    if not entry:
+        return False
+    return str(entry.get("status") or SLOT_STATUS_EMPTY) == SLOT_STATUS_EMPTY
+
+
+def is_slot_locked_for_code(
+    slots: dict[str, dict[str, Any]],
+    slot_uid: str,
+    code: str,
+) -> bool:
+    uid = migrate_legacy_slot_uid(slot_uid) or str(slot_uid)
+    entry = slots.get(uid)
+    if not entry:
+        return False
+    norm = str(code or "").strip()
+    return (
+        str(entry.get("status") or "") == SLOT_STATUS_LOCKED
+        and str(entry.get("code") or "") == norm
+    )
+
+
+def lock_slot(
+    slots: dict[str, dict[str, Any]],
+    slot_uid: str,
+    code: str,
+    *,
+    name: str = "",
+    lock_meta: dict[str, Any] | None = None,
+) -> bool:
+    """매수 주문 전 슬롯 점유 — status=locked."""
+    uid = migrate_legacy_slot_uid(slot_uid) or str(slot_uid)
+    entry = slots.get(uid)
+    if not entry:
+        return False
+    if not is_slot_lockable(slots, uid):
+        return False
+    norm = str(code or "").strip()
+    entry["status"] = SLOT_STATUS_LOCKED
+    entry["code"] = norm
+    entry["lock_meta"] = dict(lock_meta or {})
+    entry["lock_meta"].setdefault("name", name or norm)
+    entry.pop("position", None)
+    return True
+
+
+def release_slot_lock(slots: dict[str, dict[str, Any]], slot_uid: str) -> bool:
+    uid = migrate_legacy_slot_uid(slot_uid) or str(slot_uid)
+    entry = slots.get(uid)
+    if not entry:
+        return False
+    if str(entry.get("status") or "") != SLOT_STATUS_LOCKED:
+        return False
+    entry["status"] = SLOT_STATUS_EMPTY
+    entry["code"] = None
+    entry.pop("lock_meta", None)
+    entry.pop("position", None)
+    return True
 
 
 def assign_slot(
@@ -394,12 +595,25 @@ def assign_slot(
     entry = slots.get(str(slot_uid))
     if not entry:
         return False
-    if str(entry.get("status") or "empty") != "empty":
+    status = str(entry.get("status") or SLOT_STATUS_EMPTY)
+    norm = str(code or "").strip()
+    if status == SLOT_STATUS_LOCKED:
+        if str(entry.get("code") or "") != norm:
+            return False
+        if trading_mode is not None and not slot_type_matches(
+            slot_entry_mode(entry), trading_mode
+        ):
+            return False
+        entry["status"] = SLOT_STATUS_FILLED
+        entry.pop("lock_meta", None)
+        return True
+    if status != SLOT_STATUS_EMPTY:
         return False
     if trading_mode is not None and not slot_type_matches(slot_entry_mode(entry), trading_mode):
         return False
-    entry["status"] = "filled"
-    entry["code"] = str(code)
+    entry["status"] = SLOT_STATUS_FILLED
+    entry["code"] = norm
+    entry.pop("lock_meta", None)
     return True
 
 
@@ -422,8 +636,9 @@ def release_slot(slots: dict[str, dict[str, Any]], slot_uid: str) -> None:
             entry = slots.get(uid)
     if not entry:
         return
-    entry["status"] = "empty"
+    entry["status"] = SLOT_STATUS_EMPTY
     entry["code"] = None
+    entry.pop("lock_meta", None)
 
 
 def is_slot_empty(slots: dict[str, dict[str, Any]], slot_uid: str) -> bool:
@@ -431,7 +646,7 @@ def is_slot_empty(slots: dict[str, dict[str, Any]], slot_uid: str) -> bool:
     entry = slots.get(uid)
     if not entry:
         return False
-    return str(entry.get("status") or "empty") == "empty"
+    return str(entry.get("status") or SLOT_STATUS_EMPTY) == SLOT_STATUS_EMPTY
 
 
 def sync_slots_with_positions(
@@ -450,17 +665,22 @@ def sync_slots_with_positions(
 
     for _uid, entry in slots.items():
         code = entry.get("code")
-        if str(entry.get("status") or "empty") == "filled" and code:
+        status = str(entry.get("status") or SLOT_STATUS_EMPTY)
+        if status == SLOT_STATUS_LOCKED:
+            continue
+        if status == SLOT_STATUS_FILLED and code:
             if str(code) not in positions:
-                entry["status"] = "empty"
+                entry["status"] = SLOT_STATUS_EMPTY
                 entry["code"] = None
 
     for code, uid in code_to_uid.items():
         pos = positions.get(code)
         if not pos:
             continue
+        if pos.get("slot_lock") and int(pos.get("quantity") or 0) <= 0:
+            continue
         entry = slots[uid]
-        if str(entry.get("status") or "empty") == "empty":
+        if str(entry.get("status") or SLOT_STATUS_EMPTY) == SLOT_STATUS_EMPTY:
             if entry.get("code") and str(entry.get("code")) != str(code):
                 continue
             if not slot_type_matches(
@@ -542,10 +762,29 @@ def build_slot_layout(
     for entry in ordered:
         uid = str(entry.get("slot_uid") or "")
         cat = slot_entry_mode(entry)
-        status = str(entry.get("status") or "empty")
+        status = str(entry.get("status") or SLOT_STATUS_EMPTY)
         code = str(entry.get("code") or "").strip()
         pos: dict[str, Any] | None = None
-        if status == "filled" and code and code in positions:
+        if status == SLOT_STATUS_LOCKED and code:
+            pos = dict(positions.get(code) or {})
+            if not pos:
+                meta = entry.get("lock_meta") if isinstance(entry.get("lock_meta"), dict) else {}
+                pos = {
+                    "code": code,
+                    "name": str(meta.get("name") or code),
+                    "quantity": 0,
+                    "slot_lock": True,
+                    "trading_mode": cat,
+                }
+            pos["slot_uid"] = uid
+            pos["slot_id"] = cat
+            pos["slot_type"] = cat
+            pos["slot_personality"] = cat
+            pos["display_idx"] = int(entry.get("display_idx") or 0)
+            pos["trading_mode"] = cat
+            pos["slot_lock"] = True
+            assigned_codes.add(code)
+        elif status == SLOT_STATUS_FILLED and code and code in positions:
             pos = dict(positions[code])
             pos["slot_uid"] = uid
             pos["slot_id"] = cat
@@ -563,7 +802,7 @@ def build_slot_layout(
                 "slot_type": cat,
                 "display_idx": int(entry.get("display_idx") or 0),
                 "status": status,
-                "is_empty": status != "filled" or pos is None,
+                "is_empty": status not in (SLOT_STATUS_FILLED, SLOT_STATUS_LOCKED) or pos is None,
                 "is_uncategorized": False,
                 "code": code or None,
                 "position": pos,
@@ -640,27 +879,60 @@ def serialize_slot_portfolio_file(
     for entry in ordered:
         uid = str(entry.get("slot_uid") or "")
         cat = normalize_trading_category(entry.get("slot_type"))
+        live_mode = slot_entry_mode(entry)
         code = str(entry.get("code") or "").strip()
-        status = str(entry.get("status") or "empty")
+        status = str(entry.get("status") or SLOT_STATUS_EMPTY)
         pos: dict[str, Any] | None = None
-        if status == "filled" and code and code in positions:
+        lock_meta = entry.get("lock_meta") if isinstance(entry.get("lock_meta"), dict) else None
+        if status == SLOT_STATUS_LOCKED and code:
+            pos = dict(positions.get(code) or {})
+            if not pos:
+                meta = lock_meta or {}
+                pos = {
+                    "code": code,
+                    "name": str(meta.get("name") or code),
+                    "quantity": 0,
+                    "slot_lock": True,
+                    "slot_uid": uid,
+                    "display_idx": int(entry.get("display_idx") or 0),
+                    "trading_mode": live_mode,
+                }
+            else:
+                pos = dict(pos)
+                pos["slot_lock"] = True
+            pos["slot_uid"] = uid
+            pos["slot_id"] = live_mode
+            pos["slot_type"] = live_mode
+            pos["slot_personality"] = live_mode
+            pos["display_idx"] = int(entry.get("display_idx") or 0)
+            pos["trading_mode"] = live_mode
+        elif status == SLOT_STATUS_FILLED and code and code in positions:
             pos = dict(positions[code])
             pos["slot_uid"] = uid
-            pos["slot_id"] = cat
-            pos["slot_type"] = cat
+            pos["slot_id"] = live_mode
+            pos["slot_type"] = live_mode
+            pos["slot_personality"] = live_mode
             pos["display_idx"] = int(entry.get("display_idx") or 0)
-            pos["trading_mode"] = normalize_trading_category(pos.get("trading_mode"))
+            pos["trading_mode"] = live_mode
+        if status == SLOT_STATUS_LOCKED and code:
+            file_status = SLOT_STATUS_LOCKED
+        elif status == SLOT_STATUS_FILLED and code:
+            file_status = SLOT_STATUS_FILLED
+        else:
+            file_status = SLOT_STATUS_EMPTY
         cell = {
             "slot_uid": uid,
             "slot_id": cat,
             "slot_type": cat,
-            "slot_personality": cat,
+            "slot_personality": live_mode,
             "personality_updated_at": entry.get("personality_updated_at"),
             "display_idx": int(entry.get("display_idx") or 0),
-            "status": "empty" if status != "filled" or not code else "filled",
+            "status": file_status,
             "code": code or None,
             "position": pos,
         }
+        if lock_meta and file_status == SLOT_STATUS_LOCKED:
+            cell["lock_meta"] = dict(lock_meta)
         payload["categories"][cat][uid] = cell
     return payload
 
@@ -698,20 +970,30 @@ def deserialize_category_portfolio_file(
                 pc = "".join(ch for ch in pc if ch.isdigit())[-6:]
                 if len(pc) == 6:
                     code = pc
-            if status == "filled" and code:
-                merged["status"] = "filled"
+            if status == SLOT_STATUS_LOCKED and code:
+                merged["status"] = SLOT_STATUS_LOCKED
+                merged["code"] = code
+                lm = raw.get("lock_meta")
+                if isinstance(lm, dict):
+                    merged["lock_meta"] = dict(lm)
+                if isinstance(pos_raw, dict):
+                    pos = dict(pos_raw)
+                    pos["code"] = code
+                    pos["slot_uid"] = uid
+                    pos["display_idx"] = merged["display_idx"]
+                    pos["slot_lock"] = True
+                    positions[code] = pos
+            elif status == SLOT_STATUS_FILLED and code:
+                merged["status"] = SLOT_STATUS_FILLED
                 merged["code"] = code
                 if isinstance(pos_raw, dict):
                     pos = dict(pos_raw)
                     pos["code"] = code
                     pos["slot_uid"] = uid
-                    pos["slot_id"] = cat
-                    pos["slot_type"] = cat
                     pos["display_idx"] = merged["display_idx"]
-                    pos["trading_mode"] = normalize_trading_category(pos.get("trading_mode"))
                     positions[code] = pos
             else:
-                merged["status"] = "empty"
+                merged["status"] = SLOT_STATUS_EMPTY
                 merged["code"] = None
             book[uid] = merged
     return positions, normalize_slots_book(book)
@@ -750,10 +1032,7 @@ def deserialize_slot_portfolio_file(
                 pos = dict(pos_raw)
                 pos["code"] = code
                 pos["slot_uid"] = uid
-                pos["slot_id"] = merged["slot_type"]
-                pos["slot_type"] = merged["slot_type"]
                 pos["display_idx"] = merged["display_idx"]
-                pos["trading_mode"] = normalize_trading_category(pos.get("trading_mode"))
                 positions[code] = pos
         else:
             merged["status"] = "empty"
@@ -771,34 +1050,42 @@ def deserialize_legacy_portfolio_file(
         positions = {str(k): dict(v) for k, v in raw_pos.items() if isinstance(v, dict)}
     raw_slots = data.get("slots") if isinstance(data, dict) else None
     slots = normalize_slots_book(raw_slots if isinstance(raw_slots, dict) else default_slots_book())
-    for pos in positions.values():
-        if isinstance(pos, dict):
-            pos["trading_mode"] = normalize_trading_category(pos.get("trading_mode"))
     return positions, slots
 
 
 def load_portfolio_file(
     data: dict[str, Any],
+    *,
+    apply_config: bool = True,
+    recalc_targets: bool = False,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     if not isinstance(data, dict) or not data:
-        return {}, default_slots_book()
-    if is_category_grouped_portfolio_file(data):
-        return deserialize_category_portfolio_file(data)
-    if is_slot_keyed_portfolio_file(data):
-        return deserialize_slot_portfolio_file(data)
-    if "positions" in data or "slots" in data:
+        positions, slots = {}, default_slots_book()
+    elif is_category_grouped_portfolio_file(data):
+        positions, slots = deserialize_category_portfolio_file(data)
+    elif is_slot_keyed_portfolio_file(data):
+        positions, slots = deserialize_slot_portfolio_file(data)
+    elif "positions" in data or "slots" in data:
         positions, slots = deserialize_legacy_portfolio_file(data)
         assign_legacy_positions_to_slots(slots, positions)
-        return positions, normalize_slots_book(slots)
-    positions: dict[str, dict[str, Any]] = {}
-    for key, val in data.items():
-        if key in ("schema", "categories") or not isinstance(val, dict):
-            continue
-        code = str(key).strip()
-        code = "".join(ch for ch in code if ch.isdigit())[-6:]
-        if len(code) == 6:
-            positions[code] = dict(val)
-    slots = default_slots_book()
-    if positions:
-        assign_legacy_positions_to_slots(slots, positions)
+        slots = normalize_slots_book(slots)
+    else:
+        positions = {}
+        for key, val in data.items():
+            if key in ("schema", "categories") or not isinstance(val, dict):
+                continue
+            code = str(key).strip()
+            code = "".join(ch for ch in code if ch.isdigit())[-6:]
+            if len(code) == 6:
+                positions[code] = dict(val)
+        slots = default_slots_book()
+        if positions:
+            assign_legacy_positions_to_slots(slots, positions)
+
+    if apply_config:
+        return apply_config_to_portfolio_state(
+            positions,
+            slots,
+            recalc_targets=recalc_targets,
+        )
     return positions, normalize_slots_book(slots)

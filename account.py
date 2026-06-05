@@ -57,21 +57,118 @@ def _floatish(value: object) -> float:
         return 0.0
 
 
+# 대시보드·디스코드 — 수익률은 아래 fixed_seed 공식만 사용 (비중·슬롯 시드 없음)
+FIXED_SEED_WON = 10_000_000
+FIXED_ORIGINAL_CAPITAL_WON = FIXED_SEED_WON
+ORIGINAL_SEED_WON = FIXED_SEED_WON
+DASHBOARD_FIXED_PRINCIPAL_WON = FIXED_SEED_WON
+
+
+def compute_total_assets(stock_eval: int, cash: int) -> int:
+    """전체 자산 = 주식 평가금액 + 예수금."""
+    return int(stock_eval or 0) + int(cash or 0)
+
+
+def account_stock_eval_and_cash(account: dict[str, object]) -> tuple[int, int]:
+    """예수금 + 주식 평가액 — KIS 잔고 필드 우선 (보유 합산은 보조)."""
+    current_deposit = _intish(account.get("cash"))
+    kis_stock = _intish(account.get("stock_eval") or account.get("total_eval"))
+    if kis_stock > 0:
+        return kis_stock, current_deposit
+
+    current_stock_valuation = 0
+    holdings = account.get("holdings")
+    if isinstance(holdings, dict) and holdings:
+        for row in holdings.values():
+            if not isinstance(row, dict):
+                continue
+            ev = _intish(row.get("eval_amount"))
+            if ev > 0:
+                current_stock_valuation += ev
+                continue
+            qty = _intish(row.get("quantity"))
+            px = _intish(row.get("current_price"))
+            if qty > 0 and px > 0:
+                current_stock_valuation += qty * px
+    return current_stock_valuation, current_deposit
+
+
+def compute_realized_return_metrics(
+    current_deposit: int,
+    current_stock_valuation: int,
+) -> dict[str, int | float]:
+    """
+    유일한 수익률 공식 — 대시보드·디스코드·보고서 공통.
+
+        total_assets = current_deposit + current_stock_valuation
+        fixed_seed = 10_000_000
+        return_rate = ((total_assets - fixed_seed) / fixed_seed) * 100
+    """
+    current_deposit = int(current_deposit or 0)
+    current_stock_valuation = int(current_stock_valuation or 0)
+    total_assets = current_deposit + current_stock_valuation
+    fixed_seed = FIXED_SEED_WON
+    profit_loss = total_assets - fixed_seed
+    return_rate = ((total_assets - fixed_seed) / fixed_seed) * 100.0
+
+    return {
+        "current_deposit": current_deposit,
+        "current_stock_valuation": current_stock_valuation,
+        "total_assets": total_assets,
+        "fixed_seed": fixed_seed,
+        "profit_loss": profit_loss,
+        "return_rate": round(return_rate, 2),
+        # 레거시 별칭
+        "cash": current_deposit,
+        "stock_eval": current_stock_valuation,
+        "realized_pnl": profit_loss,
+        "realized_return_pct": round(return_rate, 2),
+        "total_asset_pnl": profit_loss,
+        "total_asset_return_pct": round(return_rate, 2),
+    }
+
+
+def dashboard_pnl_from_account(account: dict[str, object]) -> dict[str, int | float]:
+    """계좌 스냅샷 → compute_realized_return_metrics (단일 공식)."""
+    stock_val, deposit = account_stock_eval_and_cash(account)
+    return compute_realized_return_metrics(deposit, stock_val)
+
+
+def resolve_principal_won(principal: int | None = None) -> int:
+    base = int(principal if principal is not None else ACCOUNT_INITIAL_PRINCIPAL)
+    return max(0, base)
+
+
+def compute_principal_pnl(
+    stock_eval: int,
+    cash: int,
+    *,
+    principal: int | None = None,
+) -> int:
+    """손익(원) — 항상 profit_loss 공식 (인자 principal 무시)."""
+    _ = principal
+    return int(compute_realized_return_metrics(cash, stock_eval)["profit_loss"])
+
+
 def compute_principal_return_pct(
-    total_eval: int,
+    stock_eval: int,
     cash: int,
     *,
     principal: int | None = None,
 ) -> float:
-    """
-    누적 자산 수익률(원금 대비):
-    ((총 평가금액 + 예수금) - 초기 원금) / 초기 원금 * 100
-    """
-    base = int(principal if principal is not None else ACCOUNT_INITIAL_PRINCIPAL)
-    if base <= 0:
-        return 0.0
-    assets = int(total_eval) + int(cash)
-    return round((assets - base) / base * 100.0, 2)
+    """수익률(%) — 항상 return_rate 공식 (인자 principal 무시)."""
+    _ = principal
+    return float(compute_realized_return_metrics(cash, stock_eval)["return_rate"])
+
+
+def build_fixed_hero_dashboard_metrics(
+    stock_eval: int,
+    cash: int,
+    *,
+    seed: int | None = None,
+) -> dict[str, int | float]:
+    _ = seed
+    return compute_realized_return_metrics(cash, stock_eval)
 
 
 def _kis_rate_to_pct(value: object) -> float:
@@ -365,17 +462,27 @@ def get_account_snapshot(
     stock_eval = _resolve_stock_eval_amount(summary, holdings)
     cash = _intish(summary.get("dnca_tot_amt"))
     account_total_eval = _intish(summary.get("tot_evlu_amt"))
-    principal_return_pct = compute_principal_return_pct(stock_eval, cash)
+    realized = compute_realized_return_metrics(cash, stock_eval)
+    return_rate = float(realized["return_rate"])
+    profit_loss = int(realized["profit_loss"])
     return {
         # total_eval: 레거시 키 — 주식 평가금액만 (계좌 총자산 아님)
         "total_eval": stock_eval,
         "stock_eval": stock_eval,
         "cash": cash,
+        "total_assets": int(realized["total_assets"]),
+        "profit_loss": profit_loss,
+        "return_rate": return_rate,
         "account_total_eval": account_total_eval,
         "holdings": holdings,
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "total_return_pct": principal_return_pct,
-        "principal_return_pct": principal_return_pct,
+        "total_return_pct": return_rate,
+        "account_return_pct": return_rate,
+        "realized_return_pct": return_rate,
+        "account_pnl": profit_loss,
+        "realized_pnl": profit_loss,
+        "principal_return_pct": return_rate,
+        "principal_pnl": profit_loss,
         **pnl,
     }
 

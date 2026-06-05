@@ -224,6 +224,8 @@ def select_scalping_stocks(
             apply_expected_exit_to_position(
                 tagged, hourly_bars=bars_3m, force_recalc=True
             )
+            tagged["entry_score"] = round(float(score), 2)
+            tagged["scalp_score"] = round(float(score), 2)
             candidates.append((score, tagged))
         except Exception as exc:
             logger.warning("단타 분봉 분석 실패 %s: %s", stock["code"], exc)

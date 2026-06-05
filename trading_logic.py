@@ -176,8 +176,46 @@ def compute_expected_exit(
     }
 
 
-def refresh_target_live_fields(position: dict[str, Any]) -> None:
-    """현재가 갱신 시 목표까지 남은 비율 등 실시간 표시 필드."""
+_TARGET_FIELD_KEYS = (
+    "target_price",
+    "target_profit_pct",
+    "target_kind",
+    "target_note",
+    "target_display",
+    "target_ceiling_price",
+    "target_progress_pct",
+    "target_remaining_pct",
+    "target_set_at",
+)
+
+
+def clear_position_target_fields(position: dict[str, Any]) -> None:
+    """모드 변경 시 이전 목표가 필드 제거."""
+    for key in _TARGET_FIELD_KEYS:
+        position.pop(key, None)
+
+
+def refresh_target_live_fields(
+    position: dict[str, Any],
+    *,
+    force_recalc: bool = False,
+    hourly_bars: list[dict] | None = None,
+) -> None:
+    """
+    목표·손절 표시 필드 갱신.
+
+    force_recalc=True — trading_mode 변경 시 target_price·target_profit_pct 전량 재산출.
+    """
+    if force_recalc:
+        clear_position_target_fields(position)
+        apply_tactical_fields_on_position(position)
+        apply_expected_exit_to_position(
+            position,
+            hourly_bars=hourly_bars,
+            force_recalc=True,
+        )
+        return
+
     entry = int(position.get("entry_price") or 0)
     current = int(position.get("current_price") or entry)
     target = int(position.get("target_price") or 0)
@@ -211,6 +249,116 @@ def refresh_target_live_fields(position: dict[str, Any]) -> None:
     position["target_remaining_pct"] = round(
         max(0.0, (target - current) / current * 100.0), 2
     )
+
+
+def stop_loss_pct_for_position(position: dict[str, Any]) -> float | None:
+    """진입가 대비 손절 % (음수). ATR/설정 손절가 우선."""
+    entry = int(position.get("entry_price") or 0)
+    if entry <= 0:
+        return None
+    sl_px = int(position.get("stop_loss_price") or 0)
+    if sl_px > 0:
+        return round((sl_px - entry) / entry * 100.0, 2)
+    mode = _normalize_mode_value(position_trading_mode(position), "swing")
+    if mode == "day_trading":
+        return -round(_cfg_float("SCALP_STOP_LOSS_PCT", 1.5), 2)
+    return None
+
+
+def build_position_exit_progress(
+    position: dict[str, Any],
+    *,
+    refresh: bool = True,
+) -> dict[str, Any]:
+    """
+    매수 시 설정된 목표·손절 대비 현재 수익률 진행도 (대시보드용).
+
+    profit_pct: 현재 종목 수익률
+    target_profit_pct / stop_loss_pct: 매수·모드 기준 목표·손절 %
+    """
+    qty = int(position.get("quantity") or 0)
+    entry = int(position.get("entry_price") or 0)
+    if qty <= 0 or entry <= 0:
+        return {"has_position": False}
+
+    if not int(position.get("target_price") or 0) and not float(
+        position.get("target_profit_pct") or 0
+    ):
+        apply_expected_exit_to_position(position, force_recalc=False)
+    elif refresh:
+        refresh_target_live_fields(position)
+
+    current = int(position.get("current_price") or entry)
+    profit_pct = round((current - entry) / entry * 100.0, 2)
+
+    target_pct = float(position.get("target_profit_pct") or 0.0)
+    stop_pct = stop_loss_pct_for_position(position)
+    kind = str(position.get("target_kind") or "limit")
+    target_px = int(position.get("target_price") or 0)
+    if kind == "trailing":
+        ceiling = int(position.get("target_ceiling_price") or 0)
+        if ceiling > entry:
+            target_px = ceiling
+            target_pct = round(_profit_pct(entry, ceiling), 2)
+
+    rem_tgt = position.get("target_remaining_pct")
+    if isinstance(rem_tgt, (int, float)) and float(rem_tgt) >= 0:
+        remaining_target = float(rem_tgt)
+    elif target_pct > profit_pct:
+        remaining_target = round(target_pct - profit_pct, 2)
+    else:
+        remaining_target = 0.0
+
+    remaining_stop: float | None = None
+    if stop_pct is not None:
+        remaining_stop = round(profit_pct - stop_pct, 2)
+
+    if kind == "trailing":
+        raw_prog = position.get("target_progress_pct")
+        if isinstance(raw_prog, (int, float)) and target_pct > 0:
+            bar_fill = max(0.0, min(100.0, float(raw_prog) / target_pct * 100.0))
+        elif target_pct > 0:
+            bar_fill = max(0.0, min(100.0, profit_pct / target_pct * 100.0))
+        else:
+            bar_fill = max(0.0, min(100.0, profit_pct)) if profit_pct > 0 else 0.0
+    else:
+        raw_prog = position.get("target_progress_pct")
+        if isinstance(raw_prog, (int, float)):
+            bar_fill = max(0.0, min(100.0, float(raw_prog)))
+        elif target_pct > 0:
+            bar_fill = max(0.0, min(100.0, profit_pct / target_pct * 100.0))
+        else:
+            bar_fill = 100.0 if profit_pct >= target_pct else 0.0
+
+    lo = stop_pct if stop_pct is not None else min(-3.0, profit_pct * 0.5)
+    hi = max(target_pct, lo + 5.0)
+    span = hi - lo
+    if span <= 0:
+        span = 1.0
+    bar_current = max(0.0, min(100.0, (profit_pct - lo) / span * 100.0))
+    bar_stop = (
+        max(0.0, min(100.0, (stop_pct - lo) / span * 100.0))
+        if stop_pct is not None
+        else 0.0
+    )
+    bar_target = max(0.0, min(100.0, (target_pct - lo) / span * 100.0))
+
+    return {
+        "has_position": True,
+        "profit_pct": profit_pct,
+        "target_profit_pct": round(target_pct, 2),
+        "stop_loss_pct": stop_pct,
+        "target_kind": kind,
+        "target_note": str(position.get("target_note") or ""),
+        "remaining_to_target_pct": round(remaining_target, 2),
+        "remaining_to_stop_pct": remaining_stop,
+        "bar_fill_pct": round(bar_fill, 1),
+        "bar_current_pct": round(bar_current, 1),
+        "bar_stop_pct": round(bar_stop, 1),
+        "bar_target_pct": round(bar_target, 1),
+        "stop_loss_price": int(position.get("stop_loss_price") or 0),
+        "target_price": target_px,
+    }
 
 
 def apply_expected_exit_to_position(
@@ -648,6 +796,20 @@ def build_commander_dashboard_metrics(
     today_pct = today_combined / ref_today * 100.0 if ref_today > 0 else 0.0
     week_pct = week_realized / ref_week * 100.0 if ref_week > 0 else 0.0
 
+    return_rate = 0.0
+    profit_loss = 0
+    total_assets = 0
+    try:
+        from account import dashboard_pnl_from_account
+        from scheduler import get_account_ui_snapshot
+
+        dash = dashboard_pnl_from_account(get_account_ui_snapshot() or {})
+        total_assets = int(dash["total_assets"])
+        return_rate = float(dash["return_rate"])
+        profit_loss = int(dash["profit_loss"])
+    except Exception:
+        pass
+
     ai_day_mid = float(ai_daily.get("pct_mid", 0))
     if ai_day_mid == 0.0 and (ai_day_low or ai_day_high):
         ai_day_mid = round((ai_day_low + ai_day_high) / 2.0, 2)
@@ -667,6 +829,15 @@ def build_commander_dashboard_metrics(
         "week_realized_pnl": week_realized,
         "week_trade_count": int(weekly.get("week_trade_count", 0)),
         "week_return_pct": round(week_pct, 2),
+        "return_rate": round(return_rate, 2),
+        "profit_loss": int(profit_loss),
+        "total_assets": int(total_assets),
+        "account_return_pct": round(return_rate, 2),
+        "account_pnl": int(profit_loss),
+        "realized_return_pct": round(return_rate, 2),
+        "realized_pnl": int(profit_loss),
+        "principal_return_pct": round(return_rate, 2),
+        "principal_pnl": int(profit_loss),
         "ai_daily_pct_low": ai_day_low,
         "ai_daily_pct_high": ai_day_high,
         "ai_daily_pct_mid": ai_day_mid,
@@ -1389,6 +1560,22 @@ def plan_position_add(
     return None
 
 
+def decide_quick_half_profit_exit(
+    pos: dict[str, Any],
+    profit_pct: float,
+) -> str | None:
+    """+3% 도달 시 절반 익절 — 하루 확정 수익 회전율 최우선."""
+    if not _cfg_bool("QUICK_HALF_PROFIT_ENABLED", True):
+        return None
+    stage = int(pos.get("quick_half_profit_stage") or 0)
+    if stage >= 1:
+        return None
+    target = _cfg_float("QUICK_HALF_PROFIT_PCT", 3.0)
+    if profit_pct >= target:
+        return f"분할 익절 (확정 수익 +{target:.0f}%)"
+    return None
+
+
 def decide_position_exit(
     pos: dict[str, Any],
     current: int,
@@ -1399,6 +1586,10 @@ def decide_position_exit(
     daily_bars: list[dict] | None = None,
 ) -> str | None:
     """모드별 실시간 청산 — selected_modes.json 인격 분기."""
+    quick = decide_quick_half_profit_exit(pos, profit_pct)
+    if quick:
+        return quick
+
     mode = _normalize_mode_value(position_trading_mode(pos), "swing")
     entry = int(pos.get("entry_price") or 0)
 

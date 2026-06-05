@@ -198,33 +198,79 @@ def _passes_financial_safety(stock: dict[str, Any]) -> bool:
     return True
 
 
-def _passes_turnover_spike(stock: dict[str, Any]) -> bool:
-    """거래대금/시총 회전율이 20일 평균 대비 급증한 종목만 통과."""
+def _turnover_spike_min_mult(stock: dict[str, Any]) -> float:
+    """거래대금 flow_rank 기준 회전율 급증 임계값 (TOP3=1.5x, 그 외=5.0x)."""
+    flow_rank = int(stock.get("flow_rank") or 999)
+    top_rank = int(_cfg("BRAIN_TURNOVER_SPIKE_TOP_RANK", 3))
+    if flow_rank <= top_rank:
+        return float(_cfg("BRAIN_TURNOVER_SPIKE_TOP_MIN_MULT", 1.5))
+    return float(_cfg("BRAIN_TURNOVER_SPIKE_MIN_MULT", 5.0))
+
+
+def _is_turnover_spike_top_rank(stock: dict[str, Any]) -> bool:
+    flow_rank = int(stock.get("flow_rank") or 999)
+    top_rank = int(_cfg("BRAIN_TURNOVER_SPIKE_TOP_RANK", 3))
+    return flow_rank <= top_rank
+
+
+def _evaluate_turnover_spike(stock: dict[str, Any]) -> tuple[bool, str | None]:
+    """
+    회전율 급증 필터 — 거래대금 TOP3(flow_rank)는 1.5x, 4위~는 5.0x.
+    TOP3 + 시총 미수신(cap=0)이면 거래대금만으로 통과( enrich quote 폴백 ).
+    """
+    min_mult = _turnover_spike_min_mult(stock)
+    relaxed = _is_turnover_spike_top_rank(stock)
+    stock["turnover_spike_min_mult"] = min_mult
+    stock["turnover_spike_relaxed"] = relaxed
+
     trade_amt = int(stock.get("trade_amount") or 0)
     cap = int(stock.get("market_cap") or 0)
     if trade_amt <= 0 or cap <= 0:
-        return False
+        if relaxed and trade_amt > 0:
+            stock["turnover_spike_bypass"] = True
+            return True, None
+        return False, f"거래대금/시총 부족 (amt={trade_amt:,}, cap={cap:,})"
+
     now_turnover = trade_amt / cap
     avg_trade = float(stock.get("avg_trade_value_20d") or 0.0)
     if avg_trade <= 0:
         avg_trade = float(stock.get("avg_trade_value_5d") or 0.0)
     if avg_trade <= 0:
-        return False
+        if relaxed:
+            stock["turnover_spike_bypass"] = True
+            return True, None
+        return False, "20일/5일 평균 거래대금 없음"
     avg_turnover = avg_trade / cap
     if avg_turnover <= 0:
-        return False
+        if relaxed:
+            stock["turnover_spike_bypass"] = True
+            return True, None
+        return False, "평균 회전율 계산 불가"
+
     mult = now_turnover / avg_turnover
     stock["turnover_ratio_now"] = round(now_turnover, 6)
     stock["turnover_ratio_avg"] = round(avg_turnover, 6)
     stock["turnover_spike_mult"] = round(mult, 2)
-    return mult >= float(_cfg("BRAIN_TURNOVER_SPIKE_MIN_MULT", 5.0))
+
+    if mult >= min_mult:
+        return True, None
+    if relaxed:
+        stock["turnover_spike_bypass"] = True
+        return True, None
+    tier = f"{min_mult:.1f}x"
+    return False, f"회전율 급증 {mult:.2f}x < {tier}"
+
+
+def _passes_turnover_spike(stock: dict[str, Any]) -> bool:
+    """거래대금/시총 회전율이 20일 평균 대비 급증한 종목만 통과."""
+    passed, _ = _evaluate_turnover_spike(stock)
+    return passed
 
 
 def _passes_pullback_entry_window(stock: dict[str, Any]) -> bool:
     """
-    장기 이평 돌파 후 첫 눌림목 근사 필터.
-    - MA120/240 데이터가 있으면 해당 기준 강제
-    - 없으면 당일 급등 추격 구간(+4% 초과) 배제
+    눌림목 등락률 필터 — PULLBACK_MIN_PCT(-1%) ~ PULLBACK_MAX_PCT(-10%) 구간.
+    MA120/240 있으면 장기선 이격(-1.5~+5%) 추가 검사.
     """
     price = int(stock.get("price") or 0)
     if price <= 0:
@@ -232,8 +278,8 @@ def _passes_pullback_entry_window(stock: dict[str, Any]) -> bool:
     ma120 = stock.get("ma120")
     ma240 = stock.get("ma240")
     change = float(stock.get("change_rate") or 0.0)
-    lo = float(_cfg("BRAIN_PULLBACK_CHANGE_MIN", -2.5))
-    hi = float(_cfg("BRAIN_PULLBACK_CHANGE_MAX", 4.0))
+    lo = float(_cfg("BRAIN_PULLBACK_CHANGE_MIN", -10.0))
+    hi = float(_cfg("BRAIN_PULLBACK_CHANGE_MAX", -1.0))
     if ma120 is not None or ma240 is not None:
         try:
             m120 = float(ma120) if ma120 is not None else 0.0
@@ -245,6 +291,17 @@ def _passes_pullback_entry_window(stock: dict[str, Any]) -> bool:
         except (TypeError, ValueError):
             pass
     return lo <= change <= hi
+
+
+def _merge_rank_row_into_detail(detail: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    """거래대금 TOP row 시세·거래대금을 enrich quote에 보존 (회전율 필터용)."""
+    merged = dict(detail)
+    for key in ("trade_amount", "change_rate", "name", "raw_code", "flow_rank"):
+        if merged.get(key) in (None, "", 0) and row.get(key) not in (None, "", 0):
+            merged[key] = row[key]
+    if not merged.get("raw_code") and merged.get("code"):
+        merged["raw_code"] = f"A{merged['code']}"
+    return merged
 
 
 def scan_market_leaders(
@@ -317,6 +374,7 @@ def scan_market_leaders(
             detail["flow_score"] = round(
                 min(40.0, abs(float(row.get("change_rate") or 0)) * 2.5), 2
             )
+        detail = _merge_rank_row_into_detail(detail, row)
         if not is_common_stock_for_trade(detail):
             continue
         flow = _institutional_flow_strength(detail)
@@ -356,6 +414,236 @@ def scan_market_leaders(
     _brain_scan_cache = [dict(x) for x in enriched]
     _brain_scan_cache_at = now
     return [dict(x) for x in enriched]
+
+
+def _financial_safety_fail_reason(stock: dict[str, Any]) -> str | None:
+    """재무 안전망 미통과 사유 (통과 시 None)."""
+    if _cfg("BRAIN_REQUIRE_RISK_EXCLUDED", True):
+        if is_excluded_risk_stock(stock):
+            return "리스크 제외 종목(관리·투자주의 등)"
+    debt = stock.get("debt_ratio")
+    reserve = stock.get("reserve_ratio")
+    impaired = stock.get("capital_impairment")
+    debt_max = float(_cfg("BRAIN_FIN_DEBT_RATIO_MAX", 150.0))
+    reserve_min = float(_cfg("BRAIN_FIN_RESERVE_RATIO_MIN", 500.0))
+    if debt is not None:
+        try:
+            if float(debt) > debt_max:
+                return f"부채비율 {float(debt):.1f}% > {debt_max:.0f}%"
+        except (TypeError, ValueError):
+            pass
+    if reserve is not None:
+        try:
+            if float(reserve) < reserve_min:
+                return f"유보율 {float(reserve):.1f}% < {reserve_min:.0f}%"
+        except (TypeError, ValueError):
+            pass
+    if _cfg("BRAIN_REQUIRE_NO_IMPAIRMENT", True) and impaired is not None:
+        try:
+            if float(impaired) > 0:
+                return f"자본잠식 {impaired}"
+        except (TypeError, ValueError):
+            if str(impaired).strip().upper() in {"Y", "TRUE", "1"}:
+                return "자본잠식(Y)"
+    return None
+
+
+def _turnover_spike_fail_reason(stock: dict[str, Any]) -> str | None:
+    passed, reason = _evaluate_turnover_spike(stock)
+    return None if passed else reason
+
+
+def _pullback_entry_fail_reason(stock: dict[str, Any]) -> str | None:
+    price = int(stock.get("price") or 0)
+    if price <= 0:
+        return "시세 없음"
+    ma120 = stock.get("ma120")
+    ma240 = stock.get("ma240")
+    change = float(stock.get("change_rate") or 0.0)
+    lo = float(_cfg("BRAIN_PULLBACK_CHANGE_MIN", -10.0))
+    hi = float(_cfg("BRAIN_PULLBACK_CHANGE_MAX", -1.0))
+    if ma120 is not None or ma240 is not None:
+        try:
+            m120 = float(ma120) if ma120 is not None else 0.0
+            m240 = float(ma240) if ma240 is not None else 0.0
+            base = max(m120, m240, 1.0)
+            dist = (price - base) / base * 100.0
+            if not (-1.5 <= dist <= 5.0):
+                return f"장기선 이격 {dist:.2f}% (허용 -1.5~5.0%)"
+            if not (lo <= change <= hi):
+                return f"등락률 {change:.2f}% (허용 {lo}~{hi}%)"
+            return None
+        except (TypeError, ValueError):
+            pass
+    if lo <= change <= hi:
+        return None
+    return f"등락률 {change:.2f}% (허용 {lo}~{hi}%)"
+
+
+def diagnose_scan_market_leaders(
+    access_token: str,
+    app_key: str,
+    app_secret: str,
+    *,
+    top_n: int | None = None,
+    bypass_cache: bool = True,
+) -> dict[str, Any]:
+    """
+    scan_market_leaders() 1회 수동 진단 — 종목별 필터 통과/탈락 사유.
+    bypass_cache=True: 캐시 무시하고 최신 시세 기준.
+    """
+    n = int(top_n or _cfg("BRAIN_FLOW_TOP_N", 20))
+    enrich_n = int(_cfg("BRAIN_FLOW_QUOTE_ENRICH_TOP_N", 5))
+    ranked = get_top_trading_amount_stocks(
+        access_token, app_key, app_secret, limit=max(n, 25)
+    )
+    report: dict[str, Any] = {
+        "top_n": n,
+        "enrich_n": enrich_n,
+        "ranked_count": len(ranked),
+        "passed": [],
+        "rejected": [],
+        "leaders": [],
+        "turnover_policy": {
+            "top_rank": int(_cfg("BRAIN_TURNOVER_SPIKE_TOP_RANK", 3)),
+            "top_min_mult": float(_cfg("BRAIN_TURNOVER_SPIKE_TOP_MIN_MULT", 1.5)),
+            "default_min_mult": float(_cfg("BRAIN_TURNOVER_SPIKE_MIN_MULT", 5.0)),
+        },
+    }
+    if not ranked:
+        report["summary"] = "거래대금 TOP 목록 조회 실패"
+        return report
+
+    preliminary: list[dict[str, Any]] = []
+    for rank_idx, row in enumerate(ranked[:n], start=1):
+        code = str(row.get("code") or "")
+        if not code:
+            continue
+        row_base = dict(row)
+        row_base.setdefault("raw_code", f"A{code}")
+        trade_amt = int(row.get("trade_amount") or 0)
+        liquidity = min(50.0, math.log10(max(trade_amt, 1)) * 5) if trade_amt else 0
+        row_base["flow_rank"] = rank_idx
+        row_base["liquidity_score"] = round(liquidity, 2)
+        preliminary.append(row_base)
+
+    preliminary.sort(
+        key=lambda s: float(s.get("liquidity_score") or 0),
+        reverse=True,
+    )
+
+    enriched: list[dict[str, Any]] = []
+    for brain_rank, row in enumerate(preliminary, start=1):
+        time.sleep(0.25)
+        code = str(row.get("code") or "")
+        name = str(row.get("name") or code)
+        entry: dict[str, Any] = {
+            "code": code,
+            "name": name,
+            "flow_rank": int(row.get("flow_rank") or brain_rank),
+            "enriched": brain_rank <= enrich_n,
+            "passed": False,
+            "fail_step": None,
+            "fail_reason": None,
+        }
+
+        if brain_rank <= enrich_n:
+            if brain_rank > 1:
+                kis_loop_pause()
+            detail = fetch_quote_with_risk(access_token, app_key, app_secret, code)
+            if not detail:
+                detail = dict(row)
+            avg20 = fetch_avg_trade_value(
+                access_token,
+                app_key,
+                app_secret,
+                code,
+                days=max(5, int(_cfg("BRAIN_TURNOVER_AVG_DAYS", 20))),
+            )
+            if avg20 is not None:
+                detail["avg_trade_value_20d"] = float(avg20)
+        else:
+            detail = dict(row)
+            detail["flow_score"] = round(
+                min(40.0, abs(float(row.get("change_rate") or 0)) * 2.5), 2
+            )
+
+        detail = _merge_rank_row_into_detail(detail, row)
+        if not is_common_stock_for_trade(detail):
+            entry["fail_step"] = "common_stock"
+            entry["fail_reason"] = "일반주(A접두) 아님 또는 ETF/ETN"
+            report["rejected"].append(entry)
+            continue
+
+        flow = _institutional_flow_strength(detail)
+        trade_amt = int(detail.get("trade_amount") or row.get("trade_amount") or 0)
+        liquidity = min(50.0, math.log10(max(trade_amt, 1)) * 5) if trade_amt else 0
+        leader_boost, leader_notes = _leader_sector_boost(detail)
+        detail["flow_rank"] = int(row.get("flow_rank") or brain_rank)
+        detail["flow_score"] = round(flow, 2)
+        detail["liquidity_score"] = round(liquidity, 2)
+        detail["leader_boost"] = round(leader_boost, 2)
+        detail["brain_flow_notes"] = leader_notes
+        entry["change_rate"] = float(detail.get("change_rate") or 0.0)
+        entry["flow_score"] = detail["flow_score"]
+        entry["flow_rank"] = int(detail.get("flow_rank") or 0)
+
+        fin_reason = _financial_safety_fail_reason(detail)
+        if fin_reason:
+            entry["fail_step"] = "financial_safety"
+            entry["fail_reason"] = fin_reason
+            report["rejected"].append(entry)
+            continue
+
+        turn_reason = _turnover_spike_fail_reason(detail)
+        if turn_reason:
+            entry["fail_step"] = "turnover_spike"
+            entry["fail_reason"] = turn_reason
+            entry["turnover_spike_min_mult"] = detail.get("turnover_spike_min_mult")
+            entry["turnover_spike_relaxed"] = detail.get("turnover_spike_relaxed")
+            if detail.get("turnover_spike_mult") is not None:
+                entry["turnover_spike_mult"] = detail["turnover_spike_mult"]
+            report["rejected"].append(entry)
+            continue
+
+        pb_reason = _pullback_entry_fail_reason(detail)
+        if pb_reason:
+            entry["fail_step"] = "pullback_entry"
+            entry["fail_reason"] = pb_reason
+            report["rejected"].append(entry)
+            continue
+
+        entry["passed"] = True
+        entry["leader_boost"] = leader_boost
+        entry["turnover_spike_min_mult"] = detail.get("turnover_spike_min_mult")
+        entry["turnover_spike_relaxed"] = detail.get("turnover_spike_relaxed")
+        entry["turnover_spike_bypass"] = detail.get("turnover_spike_bypass")
+        if detail.get("turnover_spike_mult") is not None:
+            entry["turnover_spike_mult"] = detail["turnover_spike_mult"]
+        report["passed"].append(entry)
+        enriched.append(detail)
+
+    enriched.sort(
+        key=lambda s: (
+            float(s.get("leader_boost") or 0)
+            + float(s.get("flow_score") or 0)
+            + float(s.get("liquidity_score") or 0) * 0.6
+        ),
+        reverse=True,
+    )
+    for i, s in enumerate(enriched, start=1):
+        s["brain_rank"] = i
+    report["leaders"] = enriched
+    report["passed_count"] = len(enriched)
+    report["rejected_count"] = len(report["rejected"])
+    report["summary"] = (
+        f"거래대금 TOP {n} → 주도주 {len(enriched)}종목 통과 "
+        f"(탈락 {len(report['rejected'])}) · "
+        f"회전율 TOP{report['turnover_policy']['top_rank']}="
+        f"{report['turnover_policy']['top_min_mult']:.1f}x/skip · "
+        f"그외={report['turnover_policy']['default_min_mult']:.1f}x"
+    )
+    return report
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -691,10 +979,13 @@ def build_brain_universe(
     access_token: str,
     app_key: str,
     app_secret: str,
+    *,
+    log_breakdown: bool = True,
 ) -> list[dict[str, Any]]:
     """
     신규 유니버스 빌더 — FlowTracker + 테마 워치리스트 병합.
 
+    JSON 유니버스 파일을 읽지 않음. KIS API + config.BRAIN_THEME_EVENTS.
     실패 시 레거시 build_active_universe 폴백.
     """
     leaders = scan_market_leaders(access_token, app_key, app_secret)
@@ -704,17 +995,20 @@ def build_brain_universe(
         enriched = enrich_stock_with_brain(stock, auto_mode=True)
         by_code[enriched["code"]] = enriched
 
-    # 테마 워치리스트 — 거래대금 TOP 밖이어도 유니버스에 편입
-    theme_fetch_idx = 0
+    theme_added = 0
+    theme_skipped: list[dict[str, str]] = []
     for event in _theme_event_configs():
         for item in event.get("watchlist") or []:
             time.sleep(0.25)
             code = normalize_code(item.get("code"))
             if len(code) != 6 or code in by_code:
+                if len(code) == 6 and code in by_code:
+                    theme_skipped.append(
+                        {"code": code, "reason": "already_in_leaders"}
+                    )
                 continue
-            if theme_fetch_idx > 0:
+            if theme_added > 0:
                 kis_loop_pause()
-            theme_fetch_idx += 1
             detail = fetch_quote_with_risk(access_token, app_key, app_secret, code)
             if not detail:
                 detail = {
@@ -726,16 +1020,47 @@ def build_brain_universe(
             detail["theme_watchlist"] = True
             detail["flow_score"] = detail.get("flow_score") or 30.0
             if not _passes_financial_safety(detail):
+                theme_skipped.append(
+                    {
+                        "code": code,
+                        "name": str(item.get("name") or code),
+                        "reason": _financial_safety_fail_reason(detail) or "financial",
+                    }
+                )
                 continue
             if not _passes_pullback_entry_window(detail):
+                theme_skipped.append(
+                    {
+                        "code": code,
+                        "name": str(item.get("name") or code),
+                        "reason": _pullback_entry_fail_reason(detail) or "pullback",
+                    }
+                )
                 continue
             by_code[code] = enrich_stock_with_brain(detail, auto_mode=True)
+            theme_added += 1
 
     universe = sorted(
         by_code.values(),
         key=lambda s: float(s.get("brain_score") or 0),
         reverse=True,
     )
+    if log_breakdown:
+        logger.info(
+            "build_brain_universe — leaders=%d · theme_added=%d · theme_skip=%d · total=%d",
+            len(leaders),
+            theme_added,
+            len(theme_skipped),
+            len(universe),
+        )
+        for skip in theme_skipped[:6]:
+            logger.info(
+                "  theme_skip %s(%s): %s",
+                skip.get("name", skip.get("code")),
+                skip.get("code"),
+                skip.get("reason"),
+            )
+
     if universe:
         logger.info(
             "Brain universe %d종목 · 1위 %s (score=%.1f)",
@@ -745,11 +1070,144 @@ def build_brain_universe(
         )
         return universe
 
-    logger.warning("Brain universe 비어 있음 — 레거시 활성주 풀 폴백")
+    logger.warning(
+        "Brain universe 비어 있음 — 레거시 활성주 풀 폴백 (leaders=0 theme_added=0)"
+    )
     from stock_universe import build_active_universe
 
     legacy = build_active_universe(access_token, app_key, app_secret)
     return [enrich_stock_with_brain(s, auto_mode=True) for s in legacy[:40]]
+
+
+def explain_universe_load_paths() -> dict[str, Any]:
+    """
+    Universe 로드 경로 설명 — load_universe() / universe.json 은 없음.
+
+    Brain·스케줄러가 실제로 참조하는 파일·API를 반환 (진단·로그용).
+    """
+    import selected_modes
+    import trade_state
+    from bot_config_reload import SLOTS_CONFIG_FILE, load_slots_config_file
+    from pathlib import Path
+
+    project = Path(__file__).resolve().parent
+    theme_codes: list[str] = []
+    for event in _theme_event_configs():
+        for item in event.get("watchlist") or []:
+            code = normalize_code(item.get("code"))
+            if len(code) == 6:
+                theme_codes.append(code)
+
+    slots_cfg = load_slots_config_file()
+    modes_path = selected_modes.SELECTED_MODES_FILE
+    positions_path = trade_state.POSITIONS_STATE_FILE
+
+    return {
+        "load_universe_exists": False,
+        "note": (
+            "Universe는 JSON 파일에서 load 하지 않습니다. "
+            "scheduler._reload_universe_cache → get_swing_universe → build_brain_universe "
+            "(KIS API + config.BRAIN_THEME_EVENTS)."
+        ),
+        "pipeline": [
+            "scheduler._reload_universe_cache / _get_universe_cached",
+            "stock_swing.get_swing_universe",
+            "brain.build_brain_universe",
+            "  ├─ brain.scan_market_leaders (KIS 거래대금 TOP)",
+            "  ├─ config.BRAIN_THEME_EVENTS watchlist",
+            "  └─ fallback: stock_universe.build_active_universe",
+        ],
+        "files_not_universe_list": {
+            "selected_modes.json": {
+                "path": str(modes_path),
+                "exists": modes_path.is_file(),
+                "role": "슬롯/종목 매매 모드(UI) — 유니버스 종목 목록 아님",
+            },
+            "slots_config.json": {
+                "path": str(SLOTS_CONFIG_FILE),
+                "exists": SLOTS_CONFIG_FILE.is_file(),
+                "role": "슬롯 성격 스냅샷 — 유니버스 종목 목록 아님",
+            },
+            "positions_state.json": {
+                "path": str(positions_path),
+                "exists": positions_path.is_file(),
+                "role": "보유·슬롯 상태 — 부트스트랩 시 모드만 config 우선",
+            },
+        },
+        "config_py_theme_watchlist": theme_codes,
+        "market_scan_py": str(project / "market_scan.py"),
+        "legacy_fallback_module": "stock_universe.build_active_universe",
+    }
+
+
+def _config_stock_codes_from_json() -> dict[str, list[str]]:
+    """selected_modes / slots_config 에서 6자리 종목코드 추출."""
+    import re
+
+    import selected_modes
+    from bot_config_reload import load_slots_config_file
+
+    codes: set[str] = set()
+    from_modes: list[str] = []
+    from_slots: list[str] = []
+
+    modes = selected_modes.load_modes()
+    for key in modes:
+        if re.fullmatch(r"\d{6}", str(key)):
+            codes.add(str(key))
+            from_modes.append(str(key))
+
+    slots_data = load_slots_config_file()
+    for row in slots_data.get("slots") or []:
+        if not isinstance(row, dict):
+            continue
+        c = normalize_code(row.get("code"))
+        if len(c) == 6:
+            codes.add(c)
+            from_slots.append(c)
+
+    return {
+        "all": sorted(codes),
+        "from_selected_modes": sorted(set(from_modes)),
+        "from_slots_config": sorted(set(from_slots)),
+    }
+
+
+def audit_config_codes_vs_brain_sources() -> dict[str, Any]:
+    """
+    JSON 설정 종목이 Brain 유니버스 소스(테마·FlowTracker)에 포함되는지 점검.
+    """
+    paths = explain_universe_load_paths()
+    theme_set = set(paths.get("config_py_theme_watchlist") or [])
+    cfg = _config_stock_codes_from_json()
+    all_codes = cfg["all"]
+
+    per_code: list[dict[str, Any]] = []
+    for code in all_codes:
+        in_theme = code in theme_set
+        per_code.append(
+            {
+                "code": code,
+                "in_BRAIN_THEME_EVENTS": in_theme,
+                "enters_brain_via": (
+                    "theme_watchlist (config.py)"
+                    if in_theme
+                    else "scan_market_leaders only (당일 TOP+필터 통과 시)"
+                ),
+            }
+        )
+
+    missing_theme = [c for c in all_codes if c not in theme_set]
+    return {
+        "paths": paths,
+        "config_codes": cfg,
+        "per_code": per_code,
+        "summary": (
+            f"설정 종목 {len(all_codes)}개 · 테마 워치리스트 {len(theme_set)}개 · "
+            f"테마 외 종목 {len(missing_theme)}개 (FlowTracker 통과 필요)"
+        ),
+        "codes_not_in_theme_watchlist": missing_theme,
+    }
 
 
 def rank_universe_for_scan(universe: list[dict[str, Any]]) -> list[dict[str, Any]]:

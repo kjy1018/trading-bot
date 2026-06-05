@@ -27,6 +27,8 @@ _positions_bootstrapped: bool = False
 _dashboard_refresh_nonce: int = 0
 _dashboard_refresh_reason: str = ""
 _dashboard_refresh_at: str = ""
+_engine_config_reload_nonce: int = 0
+_engine_config_reload_reason: str = ""
 
 
 def _positions_persist_path() -> Path | None:
@@ -74,6 +76,25 @@ def get_dashboard_refresh_meta() -> dict[str, Any]:
             "reason": _dashboard_refresh_reason,
             "at": _dashboard_refresh_at,
         }
+
+
+def bump_engine_config_reload(reason: str = "config_change") -> int:
+    """슬롯 모드·positions_state 변경 — 엔진 reload_engine_from_disk 트리거."""
+    global _engine_config_reload_nonce, _engine_config_reload_reason
+    with _lock:
+        _engine_config_reload_nonce += 1
+        _engine_config_reload_reason = str(reason or "config_change")
+        return int(_engine_config_reload_nonce)
+
+
+def get_engine_config_reload_nonce() -> int:
+    with _lock:
+        return int(_engine_config_reload_nonce)
+
+
+def get_engine_config_reload_reason() -> str:
+    with _lock:
+        return str(_engine_config_reload_reason or "")
 
 
 def _monday_of(day: date | None = None) -> date:
@@ -127,11 +148,15 @@ def _load_json(path: Path) -> dict[str, Any]:
         return {}
 
 
-def _read_portfolio_from_path(path: Path) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+def _read_portfolio_from_path(
+    path: Path,
+    *,
+    recalc_targets: bool = False,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     from slot_registry import load_portfolio_file
 
     data = _load_json(path)
-    return load_portfolio_file(data)
+    return load_portfolio_file(data, recalc_targets=recalc_targets)
 
 
 def _read_positions_from_path(path: Path) -> dict[str, dict[str, Any]]:
@@ -165,26 +190,55 @@ def _bootstrap_runtime_positions_once() -> None:
     _positions_bootstrapped = True
     from slot_registry import (
         assign_legacy_positions_to_slots,
+        apply_config_to_portfolio_state,
         default_slots_book,
         normalize_slots_book,
         sync_slots_with_positions,
     )
 
+    import selected_modes
+
+    selected_modes.load_modes()
+    try:
+        from bot_config_reload import load_slots_config_file
+
+        load_slots_config_file()
+    except ImportError:
+        pass
+
     loaded: dict[str, dict[str, Any]] = {}
     slots = default_slots_book()
     persist_path = _positions_persist_path()
     if persist_path is not None and persist_path.is_file():
-        loaded, slots = _read_portfolio_from_path(persist_path)
+        loaded, slots = _read_portfolio_from_path(
+            persist_path,
+            recalc_targets=True,
+        )
     elif POSITIONS_STATE_FILE.is_file():
-        loaded, slots = _read_portfolio_from_path(POSITIONS_STATE_FILE)
-    if loaded:
-        _runtime_positions = {k: dict(v) for k, v in loaded.items()}
-        assign_legacy_positions_to_slots(slots, _runtime_positions)
-        sync_slots_with_positions(slots, _runtime_positions)
-        _runtime_slots = normalize_slots_book(slots)
-        _bump_positions_revision()
+        loaded, slots = _read_portfolio_from_path(
+            POSITIONS_STATE_FILE,
+            recalc_targets=True,
+        )
     else:
-        _runtime_slots = normalize_slots_book(slots)
+        loaded, slots = apply_config_to_portfolio_state(
+            {},
+            slots,
+            recalc_targets=False,
+        )
+
+    _runtime_positions = {k: dict(v) for k, v in loaded.items()}
+    _runtime_slots = normalize_slots_book(slots)
+    if loaded or slots:
+        _bump_positions_revision()
+
+    try:
+        from bot_config_reload import finalize_config_write, suppress_file_watch
+
+        suppress_file_watch(3.0)
+        _maybe_persist_local_positions_file(_runtime_positions, _runtime_slots)
+        finalize_config_write()
+    except ImportError:
+        _maybe_persist_local_positions_file(_runtime_positions, _runtime_slots)
 
 
 def _normalize_daily_data(data: dict[str, Any]) -> dict[str, Any]:
@@ -592,6 +646,23 @@ def record_completed_trade(
             profit_pct=float(profit_pct),
             exit_type=exit_type,
         )
+
+        if "손절" in str(exit_type or ""):
+            try:
+                from sell_history import record_stop_loss_sell
+
+                record_stop_loss_sell(
+                    code=code,
+                    name=name,
+                    exit_type=exit_type,
+                    sell_time=sell_time,
+                    pnl=int(pnl),
+                    profit_pct=float(profit_pct),
+                )
+            except Exception as exc:
+                __import__("logging").getLogger(__name__).debug(
+                    "sell_history 기록 스킵: %s", exc
+                )
 
         receipt: dict[str, Any] = {
             "종목명": name,

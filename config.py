@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 # 프로젝트 루트 .env 로드 (Streamlit/scheduler 직접 실행 시 환경변수 주입)
 load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 
+PROJECT_DIR = Path(__file__).resolve().parent
+
 # config.py — 한국투자증권 모의투자 · 스윙 매매
 
 APP_KEY = str(os.environ.get("APP_KEY", "")).strip()
@@ -76,6 +78,8 @@ POLLING_BALANCE_INTERVAL_SEC = 30.0  # inquire_balance 동기화
 POLLING_DAILY_BARS_CACHE_SEC = 300  # 종목별 일봉 캐시
 POLLING_DAILY_LOOKBACK_DAYS = 90
 REALTIME_UNIVERSE_REFRESH_SEC = 600  # brain 유니버스 — 10분마다만 KIS 순위/수급 스캔
+WATCH_STALE_HARD_REFRESH_SEC = 120  # 최근 감시 시각 2분+ 지연 시 엔진 Hard Refresh
+ORDER_STUCK_PURGE_SEC = 45  # queued/submitting 고착 주문 제거 기준(초)
 BRAIN_FLOW_CACHE_SEC = 300  # 거래대금 TOP-N + 수급 스캔 캐시 (5분)
 TRADE_RANK_CACHE_SEC = 300  # 거래대금 순위 API — 5분 캐시 (코스닥 프록시·AI 공용)
 BRAIN_FLOW_QUOTE_ENRICH_TOP_N = 5  # 상위 N종목만 현재가 추가 조회
@@ -87,7 +91,34 @@ SCAN_ALIGN_TO_HOUR = False
 SCALP_MONITOR_INTERVAL_SEC = 0.0
 SWING_MONITOR_INTERVAL_SEC = 8.0
 LONG_MONITOR_INTERVAL_SEC = 10.0
-POLLING_DISABLE_DAY_TRADING = True  # 폴링 모드에서 단타 진입·분봉 청산 비활성
+POLLING_DISABLE_DAY_TRADING = True  # 폴링 모드 기본 단타 OFF (오전 이격도 돌파 구간만 예외)
+POLLING_ENABLE_MORNING_SCALP = True  # 09~10시 이격도 돌파 단타 허용
+POLLING_ENABLE_SCALP_FALLBACK = True  # 스윙 후보 부족 시 단타 스캔 보조
+MARKET_SCAN_MIN_PICKS = 3  # 최소 후보 목표 — 하루 매도 3건 회전율 목표
+MARKET_SCAN_ENABLE_FALLBACK = True  # 단타·추세추종 폴백
+
+# 회전율 전략 — 이격도 수렴·시간대별 공략
+DAILY_SELL_TARGET = 3  # 하루 확정 익절(분할 매도) 목표 건수
+MA_DISPARITY_TARGET = 100.0  # 이격도 = (현재가/MA)×100, 100=평균선
+MA_CONVERGENCE_BAND_PCT = 3.0  # 100±3% 이내 우선 매수
+MA_CONVERGENCE_MAX_DIST_PCT = 8.0  # 이격도 스캔 최대 허용 거리
+MA_CONVERGENCE_MA_PERIOD = 20
+MA_CONVERGENCE_RANK_BOOST = 50  # 수렴 종목 entry_score_final 가산
+MORNING_ATTACK_START = "09:00"
+MORNING_ATTACK_END = "10:00"
+AFTERNOON_ATTACK_START = "14:00"
+AFTERNOON_ATTACK_END = "15:00"
+MORNING_SCALP_MIN_CHANGE_PCT = 2.0
+MORNING_SCALP_SCAN_TOP_N = 25
+SWING_AFTERNOON_REQUIRE_GOLDEN = True  # 14~15시 정배열 눌림목만
+QUICK_HALF_PROFIT_ENABLED = True
+QUICK_HALF_PROFIT_PCT = 3.0  # +3% 도달 시 즉시 절반 익절
+QUICK_HALF_PROFIT_FRACTION = 0.5
+
+# UI 수동 매수 — 디버그 (당분간 True, 안정화 후 False)
+MANUAL_BUY_DEBUG_FORCE_QUEUE = True
+MANUAL_BUY_DEBUG_SKIP_MARKET_HOURS = True  # 장외에도 큐 접수 시도
+MANUAL_BUY_DEBUG_FORCE_QTY = 1  # bet_quantity 0일 때 1주 강제
 
 # 단타 분봉 진입·청산 (1m/3m 수급)
 SCALP_MIN_CHANGE_PCT = 2.0
@@ -112,7 +143,10 @@ SWING_PARTIAL_EXIT_PCT_1 = 12.0
 SWING_HARD_STOP_LOSS_PCT = 15.0
 SWING_MIN_HOLD_BIZ_DAYS = 3  # 최소 보유 영업일 — 이전 조기 손절 억제
 SWING_MA_EXIT_BREAK_PCT = 2.0  # MA20 이탈 % 이하에서만 구조 손절
-SWING_ENTRY_REQUIRE_MA_ALIGNED = True
+SWING_ENTRY_REQUIRE_MA_ALIGNED = False  # 완화: 정배열 필수 해제 → 이평 근접/상방
+SWING_REQUIRE_GOLDEN_ALIGNMENT = False  # True=MA5>MA20>MA60 정배열 필수
+SWING_REQUIRE_MA_PROXIMITY = True  # False 시 기존 정배열 로직
+SWING_MA_PROXIMITY_PCT = 5.0  # MA20·MA5 대비 ±% 이내 또는 상방이면 통과
 SWING_MAX_SPLIT_BUYS = 2
 SWING_DIP_BUY_MIN_PCT = 3.0
 SWING_DIP_BUY_MAX_PCT = 10.0
@@ -177,11 +211,11 @@ DISCORD_CHANNEL_ID = str(os.environ.get("DISCORD_CHANNEL_ID")).strip()
 
 NOTIFY_MARKET_OPEN_SUMMARY_TIME = "09:05"
 NOTIFY_MARKET_OPEN_SUMMARY_WINDOW_MIN = 10  # 장시작 요약 발송 허용 구간(분)
-NOTIFY_MARKET_CLOSE_SUMMARY_TIME = "15:35"  # 일일 결산 영수증 (하루 1회)
-NOTIFY_MARKET_CLOSE_SUMMARY_WINDOW_MIN = 10  # 결산 발송 허용 구간 — 18시 재발송 방지
-# 장 마감 직후 AI 복기·시장·내일 전략 리포트
+NOTIFY_MARKET_CLOSE_SUMMARY_TIME = "16:00"  # 일일 결산 영수증 (하루 1회, 16시)
+NOTIFY_MARKET_CLOSE_SUMMARY_WINDOW_MIN = 10  # 결산 발송 허용 구간
+# 장 마감 AI 복기·시장·내일 전략 리포트 (정산 수익률과 동일 공식)
 ENABLE_DAILY_CLOSE_REPORT = True
-DAILY_CLOSE_REPORT_TIME = "15:31"  # 15:30 마감 직후
+DAILY_CLOSE_REPORT_TIME = "16:00"  # 결산·리포트 동시 발송
 DAILY_CLOSE_REPORT_WINDOW_MIN = 20
 ENABLE_DAILY_CLOSE_REPORT_AI = True  # GEMINI_API_KEY 있으면 내일 전략 LLM 보강
 ENABLE_AI_BRIEFING = True
@@ -197,6 +231,20 @@ TARGET_PROFIT_PCT = 12.0
 TARGET_PROFIT_MAX_PCT = 15.0
 TARGET_LOSS_PCT = -6.0
 STOP_LOSS_PCT = TARGET_LOSS_PCT
+
+# 패닉 손절 — 모드 무관 -5% 도달 시 시장가 청산
+PANIC_STOP_LOSS_PCT = -5.0
+PANIC_STOP_SELL_FRACTION = 0.5  # 0.5=절반, 1.0=전량
+PRIORITY_MANAGE_DISTRESSED_BLOCK_NEW_BUYS = True  # -5% 보유 시 신규 매수 보류
+
+# ML 손절 확률 게이트 (매수 직전 차트 패턴 분류)
+ML_STOP_LOSS_ENABLED = True
+ML_STOP_LOSS_REJECT_PROB = 0.60  # 손절 확률 ≥ 60% → 매수 거부
+ML_STOP_LOSS_MODEL_PATH = PROJECT_DIR / "models" / "stop_loss_classifier.joblib"
+ML_STOP_LOSS_DATASET_PATH = PROJECT_DIR / "data" / "trade_pattern_dataset.csv"
+
+# 당일 손절 종목 재매수 후보 점수 페널티 (sell_history.json)
+LOSS_REENTRY_PENALTY_POINTS = 50
 
 # ATR 가변 손절 (1시간봉 Wilder ATR)
 ATR_PERIOD = 14
@@ -232,8 +280,11 @@ SWING_MA_LONG = 60
 SWING_MAX_CHASE_CHANGE_PCT = 5.0
 SWING_PULLBACK_BARS = 6
 SWING_VOLUME_DRY_RATIO = 0.5
-SWING_NEAR_MA5_PCT = 2.5
-SWING_NEAR_MA20_PCT = 3.5
+SWING_NEAR_MA5_PCT = 5.5  # +3%p 완화
+SWING_NEAR_MA20_PCT = 6.5  # +3%p 완화
+SWING_PULLBACK_DRIFT_MIN_PCT = -7.0  # 눌림목 횡보 하한 (-4 → -7, 3%p 완화)
+SWING_RELAX_PULLBACK_BREATH = True  # 거래량 감소 조건 완화
+SWING_VOLUME_DRY_RATIO_RELAXED = 0.7
 SWING_USE_LIMIT_AT_CURRENT = True
 
 # ── 중앙 판단 뇌 (Brain Classifier) ──
@@ -258,14 +309,19 @@ BRAIN_MID_CAP_WON = 500_000_000_000
 BRAIN_VOLATILITY_SCALP_MIN = 6.0
 BRAIN_VOLATILITY_SWING_MAX = 5.5
 BRAIN_MIN_RECOMMEND_SCORE = 22.0
-BRAIN_TURNOVER_SPIKE_MIN_MULT = 5.0
+BRAIN_TURNOVER_SPIKE_MIN_MULT = 2.5  # TOP 4위~ 회전율 급증 (기존 5.0)
+BRAIN_TURNOVER_SPIKE_TOP_RANK = 3  # 거래대금 TOP N — 회전율 필터 완화(1.5x 미달 시 skip)
+BRAIN_TURNOVER_SPIKE_TOP_MIN_MULT = 1.5  # TOP N: 1.5x 이상이면 정상 통과, 미달 시 bypass
 BRAIN_TURNOVER_AVG_DAYS = 20
 BRAIN_FIN_DEBT_RATIO_MAX = 150.0
 BRAIN_FIN_RESERVE_RATIO_MIN = 500.0
 BRAIN_REQUIRE_NO_IMPAIRMENT = True
 BRAIN_REQUIRE_RISK_EXCLUDED = True
-BRAIN_PULLBACK_CHANGE_MIN = -2.5
-BRAIN_PULLBACK_CHANGE_MAX = 4.0
+# 눌림목 등락률 — 약한 조정(-1%)부터 급락(-13%)까지 진입 허용 (+3%p 완화)
+PULLBACK_MIN_PCT = -1.0
+PULLBACK_MAX_PCT = -13.0
+BRAIN_PULLBACK_CHANGE_MIN = PULLBACK_MAX_PCT
+BRAIN_PULLBACK_CHANGE_MAX = PULLBACK_MIN_PCT
 BRAIN_LEADER_SECTOR_CODES = (
     "000660",
     "005930",

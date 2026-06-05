@@ -307,6 +307,15 @@ def build_daily_close_report(
         )
 
     acct = dict(account or {})
+    from report import (
+        apply_report_settlement_to_account,
+        normalize_settlement_for_report,
+        purge_phantom_positions_if_broker_empty,
+    )
+
+    purge_phantom_positions_if_broker_empty(acct)
+    settlement = normalize_settlement_for_report(acct, positions=holdings)
+    acct = apply_report_settlement_to_account(acct, settlement)
     ctx = {
         "review": {
             "realized_pnl": review.get("realized_pnl"),
@@ -352,6 +361,11 @@ def build_daily_close_report(
         "indices": indices,
         "holdings_ma": holdings_ma,
         "account_snapshot": acct,
+        "return_rate": float(settlement["return_rate"]),
+        "profit_loss": int(settlement["profit_loss"]),
+        "total_assets": int(settlement["total_assets"]),
+        "current_deposit": int(settlement["current_deposit"]),
+        "current_stock_valuation": int(settlement["current_stock_valuation"]),
         "tomorrow_strategy": tomorrow_text,
         "tomorrow_ai": bool(ai_strategy),
         "markdown": md,
@@ -374,9 +388,27 @@ def format_report_markdown(
     tomorrow_strategy: str,
     ai_generated: bool,
 ) -> str:
+    cash = int(account.get("cash") or 0)
+    stock_eval = int(account.get("stock_eval") or account.get("total_eval") or 0)
+    from report import normalize_settlement_for_report
+
+    settlement = normalize_settlement_for_report(account)
+    pr_pct = float(settlement["return_rate"])
+    pr_pnl = int(settlement["profit_loss"])
+    total_assets = int(settlement["total_assets"])
+    if settlement.get("holdings_zero_override"):
+        stock_eval = 0
+
     lines: list[str] = [
         f"# 📋 장 마감 리포트 ({trade_date})",
         f"생성: {generated_at}",
+        "",
+        "## 💰 정산 수익률",
+        (
+            f"- **{pr_pct:+.2f}%** "
+            f"(예수금 {cash:,} + 주식 {stock_eval:,} = 총자산 {total_assets:,}원 · "
+            f"손익 {pr_pnl:+,}원 · 원금 10,000,000원)"
+        ),
         "",
         "## 1. 오늘의 복기",
     ]
@@ -414,11 +446,6 @@ def format_report_markdown(
             )
     else:
         lines.append("- 보유 종목 없음")
-
-    cash = int(account.get("cash") or 0)
-    eval_amt = int(account.get("account_total_eval") or account.get("total_eval") or 0)
-    if eval_amt or cash:
-        lines.append(f"- 계좌: 주식평가 {eval_amt:,}원 · 예수금 {cash:,}원")
 
     tag = " (AI)" if ai_generated else ""
     lines.extend(["", f"## 3. 내일 전략{tag}", tomorrow_strategy.strip()])

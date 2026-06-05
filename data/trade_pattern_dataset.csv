@@ -1,0 +1,4 @@
+sample_id,stock_code,stock_name,buy_time,buy_price,sell_time,sell_price,pnl,profit_pct,exit_type,label_stop_loss,trading_mode,augment_offset_bars,hour_of_day,golden_alignment,ma5_ma20_spread_pct,ma20_ma60_spread_pct,ma20_slope_pct,pullback_from_5bar_high_pct,volume_dry_ratio,last_bar_body_pct,rsi_14,atr_pct,change_rate,brain_rank,brain_score,entry_price_log
+005930_2026-06-01_155050,005930,테스트,2026-06-01 15:50:50,10000,2026-06-01 15:50:50,10500,5000,5.0,익절,0,swing,0,15.833333333333334,0.0,4.8376,0.0,3.1448,0.0,0.4483,-0.2857,70.303,3.3207,0.0,0.0,0.0,4.0
+041190_2026-06-02_134639,041190,우리기술투자,2026-06-02 13:46:39,6071,2026-06-05 12:31:07,5670,-58245,-5.8608666777353475,손절,1,swing,0,13.766666666666667,0.0,0.0,0.0,0.0,-1.1254,1.3412,1.318,62.5,2.1835,0.0,0.0,0.0,3.7833
+seed_041190_loss_add,041190,우리기술투자,2026-06-02 13:47:49,6071,2026-06-05 12:31:07,5670,-58245,-5.86,손절,1,swing,0,13.783333333333333,0.0,0.8304,0.0,0.0,-1.1254,1.3412,1.318,45.0382,2.4739,0.0,0.0,0.0,3.7833

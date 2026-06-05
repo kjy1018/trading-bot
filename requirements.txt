@@ -1,3 +1,4 @@
+watchdog
 requests
 pandas
 streamlit
@@ -5,3 +6,6 @@ streamlit-autorefresh
 websocket-client
 discord.py
 python-dotenv
+scikit-learn
+joblib
+numpy

@@ -209,6 +209,41 @@ def _ma(values: list[int | float], period: int) -> float | None:
     return sum(values[-period:]) / period
 
 
+def _swing_require_golden() -> bool:
+    try:
+        import config as cfg
+
+        return bool(getattr(cfg, "SWING_REQUIRE_GOLDEN_ALIGNMENT", False))
+    except ImportError:
+        return False
+
+
+def _swing_ma_proximity_pct() -> float:
+    try:
+        import config as cfg
+
+        return float(getattr(cfg, "SWING_MA_PROXIMITY_PCT", 5.0))
+    except ImportError:
+        return 5.0
+
+
+def _is_above_or_near_ma(closes: list[int], price: int) -> bool:
+    """정배열 대신 — 현재가가 MA20/MA5 위 또는 근접(±SWING_MA_PROXIMITY_PCT%)."""
+    if len(closes) < SWING_MA_MID + 2:
+        return False
+    ma5 = _ma(closes, SWING_MA_SHORT)
+    ma20 = _ma(closes, SWING_MA_MID)
+    if ma20 is None or ma20 <= 0:
+        return False
+    tol = _swing_ma_proximity_pct() / 100.0
+    floor20 = ma20 * (1.0 - tol)
+    if price >= floor20:
+        return True
+    if ma5 and ma5 > 0 and price >= ma5 * (1.0 - tol):
+        return True
+    return False
+
+
 def _is_golden_alignment(closes: list[int]) -> bool:
     """1H MA5 > MA20 > MA60 정배열 + MA20 우상향."""
     if len(closes) < SWING_MA_LONG + 5:
@@ -260,7 +295,19 @@ def _is_pullback_breath(bars: list[dict], live_change: float) -> bool:
     if start_c <= 0:
         return False
     drift_pct = (end_c - start_c) / start_c * 100
-    if drift_pct > 2.0 or drift_pct < -4.0:
+    drift_min = -4.0
+    vol_ratio = SWING_VOLUME_DRY_RATIO
+    try:
+        import config as cfg
+
+        drift_min = float(getattr(cfg, "SWING_PULLBACK_DRIFT_MIN_PCT", -7.0))
+        if getattr(cfg, "SWING_RELAX_PULLBACK_BREATH", True):
+            vol_ratio = float(
+                getattr(cfg, "SWING_VOLUME_DRY_RATIO_RELAXED", 0.7)
+            )
+    except ImportError:
+        pass
+    if drift_pct > 2.0 or drift_pct < drift_min:
         return False
 
     if len(volumes) < 3:
@@ -269,10 +316,10 @@ def _is_pullback_breath(bars: list[dict], live_change: float) -> bool:
     vol_prev = volumes[-3]
     if vol_prev <= 0:
         return False
-    if vol_last > vol_prev * SWING_VOLUME_DRY_RATIO:
+    if vol_last > vol_prev * vol_ratio:
         return False
     avg_vol = sum(volumes[-(n + 3) : -2]) / max(len(volumes[-(n + 3) : -2]), 1)
-    if avg_vol > 0 and vol_last > avg_vol * SWING_VOLUME_DRY_RATIO:
+    if avg_vol > 0 and vol_last > avg_vol * vol_ratio:
         return False
     return True
 
@@ -288,6 +335,8 @@ def _near_ma_support(price: int, ma5: float, ma20: float) -> bool:
 def _passes_quality_and_setup(
     stock: dict,
     bars: list[dict],
+    *,
+    require_golden: bool | None = None,
 ) -> tuple[float, dict] | None:
     if len(bars) < SWING_MA_LONG + 5:
         return None
@@ -299,15 +348,40 @@ def _passes_quality_and_setup(
     if ma5 is None or ma20 is None:
         return None
 
-    if not _is_golden_alignment(closes):
-        return None
-    if not _is_pullback_breath(bars, stock.get("change_rate", 0.0)):
-        return None
+    use_golden = _swing_require_golden() if require_golden is None else bool(require_golden)
+    if use_golden:
+        if not _is_golden_alignment(closes):
+            return None
+    else:
+        try:
+            import config as cfg
+
+            if getattr(cfg, "SWING_REQUIRE_MA_PROXIMITY", True):
+                if not _is_above_or_near_ma(closes, hourly_close):
+                    return None
+        except ImportError:
+            if not _is_above_or_near_ma(closes, hourly_close):
+                return None
+    live_chg = float(stock.get("change_rate") or 0.0)
+    breath_ok = _is_pullback_breath(bars, live_chg)
+    if not breath_ok:
+        try:
+            import config as cfg
+
+            lo = float(getattr(cfg, "PULLBACK_MAX_PCT", -13.0))
+            hi = float(getattr(cfg, "PULLBACK_MIN_PCT", -1.0))
+            if getattr(cfg, "SWING_RELAX_PULLBACK_BREATH", True) and lo <= live_chg <= hi:
+                breath_ok = True
+        except ImportError:
+            pass
+        if not breath_ok:
+            return None
     if not _near_ma_support(hourly_close, ma5, ma20):
         return None
 
     dist_ma = min(abs(hourly_close - ma5) / ma5, abs(hourly_close - ma20) / ma20) * 100
-    score = 100 - dist_ma + (ma5 - ma20) / ma20 * 10
+    align_bonus = (ma5 - ma20) / ma20 * 10 if use_golden else 5.0
+    score = 100 - dist_ma + align_bonus
 
     ohlc = [
         {
@@ -336,7 +410,15 @@ def _passes_quality_and_setup(
         "swing_score": round(score, 2),
         "ma5": int(ma5),
         "ma20": int(ma20),
-        "setup": "1H 정배열·눌림목",
+        "setup": (
+            "오후 정배열·눌림목"
+            if require_golden is True
+            else (
+                "1H 정배열·눌림목"
+                if use_golden
+                else "1H 이평근절·눌림목"
+            )
+        ),
         "swing_setup_passed": True,
         "atr_14": round(atr_val, 4),
         "atr_stop_mult": ATR_STOP_MULT,
@@ -361,8 +443,18 @@ def select_swing_stocks(
     universe: list[dict],
     exclude_codes: set[str] | None = None,
     max_count: int = 1,
+    *,
+    afternoon_mode: bool = False,
 ) -> list[dict]:
-    """1시간봉 정배열 + 눌림목 (매수가 = 1H 종가)."""
+    """1시간봉 눌림목 (afternoon_mode=True 시 정배열 필수)."""
+    require_golden = None
+    if afternoon_mode:
+        try:
+            import config as cfg
+
+            require_golden = bool(getattr(cfg, "SWING_AFTERNOON_REQUIRE_GOLDEN", True))
+        except ImportError:
+            require_golden = True
     exclude = exclude_codes or set()
     candidates: list[tuple[float, dict]] = []
 
@@ -375,7 +467,9 @@ def select_swing_stocks(
             bars = _fetch_hourly_bars(
                 access_token, app_key, app_secret, stock["code"]
             )
-            result = _passes_quality_and_setup(stock, bars)
+            result = _passes_quality_and_setup(
+                stock, bars, require_golden=require_golden
+            )
             if result:
                 score, enriched = result
                 tagged = enrich_stock_with_brain(
@@ -383,6 +477,8 @@ def select_swing_stocks(
                     auto_mode=True,
                 )
                 apply_expected_exit_to_position(tagged, hourly_bars=bars)
+                tagged["entry_score"] = round(float(score), 2)
+                tagged["swing_score"] = round(float(score), 2)
                 candidates.append((score, tagged))
         except Exception as exc:
             logger.warning("1H 차트 분석 실패 %s: %s", stock["code"], exc)

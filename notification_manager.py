@@ -14,13 +14,13 @@ from discord_control import (
     send_daily_close_report_embed,
     send_daily_summary_embed,
     send_fill_embed,
+    send_holding_change_embed,
 )
+from holdings_watch import mark_sell_notified
 
 
 def _format_cumulative_return_text(total_eval: int, cash: int) -> str:
-    return _format_signed_pct(
-        _compute_cumulative_asset_return_pct(total_eval, cash)
-    )
+    return _format_signed_pct(_compute_cumulative_asset_return_pct(total_eval, cash))
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,48 @@ class NotificationManager:
             briefing=briefing,
             news_links=news,  # type: ignore[arg-type]
         )
+        if side == "매도":
+            mark_sell_notified(code)
+
+    def send_holding_change(
+        self,
+        *,
+        change_kind: str,
+        code: str,
+        name: str,
+        old_qty: int,
+        new_qty: int,
+        delta_qty: int,
+        detail: str = "",
+    ) -> None:
+        """주문 체결 알림 백업 — 계좌 동기화로 감지한 보유 수량 변화."""
+        if not self.enabled:
+            return
+        kind_txt = {
+            "partial_sell": "분할/부분 매도",
+            "sold_out": "전량 매도",
+            "qty_increase": "수량 증가",
+            "new_holding": "신규 보유",
+        }.get(change_kind, "보유 변동")
+        ts = datetime.now().strftime("%H:%M:%S")
+        body = (
+            f"[{ts}] 보유 변동 · {kind_txt}\n"
+            f"{name}({code}) {int(old_qty)}주 → {int(new_qty)}주 "
+            f"({int(delta_qty):+d}주)\n"
+            f"{detail or '계좌 동기화 감지'}"
+        )
+        self.send_text(body)
+        send_holding_change_embed(
+            change_kind=change_kind,
+            code=code,
+            name=name,
+            old_qty=int(old_qty),
+            new_qty=int(new_qty),
+            delta_qty=int(delta_qty),
+            detail=detail,
+        )
+        if change_kind in ("partial_sell", "sold_out"):
+            mark_sell_notified(code)
 
     def send_daily_close_report(self, report: dict[str, Any]) -> None:
         """장 마감 AI 복기·시장·내일 전략 — 텔레그램/카카오/디스코드."""
@@ -95,13 +137,19 @@ class NotificationManager:
         realized_pnl: int = 0,
         **kwargs: Any,
     ) -> None:
+        from account import compute_realized_return_metrics
+
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        settlement = compute_realized_return_metrics(int(cash), int(total_eval))
+        ret_txt = _format_signed_pct(float(settlement["return_rate"]))
         body = (
-            f"[{tag}] 무인 운용 요약 ({ts})\n"
+            f"[{tag}] 일일 정산 ({ts})\n"
+            f"정산 수익률 {ret_txt} "
+            f"(총자산 {int(settlement['total_assets']):,}원 · "
+            f"손익 {int(settlement['profit_loss']):+,}원)\n"
+            f"주식 {int(total_eval):,} + 예수금 {int(cash):,} · "
             f"당일 평가손익 {daily_eval_pnl:+,}원 ({daily_eval_pnl_pct:+.2f}%) · "
-            f"누적 자산 수익률(원금 1천만 대비) "
-            f"{_format_cumulative_return_text(total_eval, cash)}\n"
-            f"주식평가 {total_eval:,}원 · 예수금 {cash:,}원 · 보유 {slot_count}슬롯"
+            f"보유 {slot_count}슬롯"
         )
         self.send_text(body)
         payload = build_ai_briefing_payload("국내 증시 장마감 브리핑", side=tag)
