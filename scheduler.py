@@ -631,7 +631,11 @@ def _purge_stuck_orders(*, max_age_sec: float | None = None) -> int:
 
 
 def _force_engine_hard_refresh(reason: str) -> None:
-    """감시 시각 정체·스캔 락 고착 시 — 스캔 재시작 유도."""
+    """감시 시각 정체·스캔 락 고착 시 — (Cool-down 활성 시 스킵) 스캔 재시작 유도."""
+    from engine_cooldown import is_cooldown_active
+
+    if is_cooldown_active():
+        return
     global _scan_active, _last_scan_at
     with _scan_active_lock:
         if _scan_active:
@@ -646,22 +650,97 @@ def _force_engine_hard_refresh(reason: str) -> None:
     logger.warning(summary)
 
 
-def _maybe_hard_refresh_if_watch_stale(now_dt: datetime) -> None:
-    """장중 최근 감시 시각이 2분+ 밀리면 Hard Refresh."""
+def _on_engine_cooldown_enter(reason: str) -> None:
+    global _scan_active, _last_scan_at
+    with _scan_active_lock:
+        if _scan_active:
+            _scan_active = False
+    _last_scan_at = 0.0
+    set_buy_pause(True, source="cooldown")
+    _set_engine_mode("cooldown")
+    with _state_lock:
+        _state["cooldown_active"] = True
+        _state["cooldown_reason"] = reason
+        from engine_cooldown import cooldown_snapshot
+
+        snap = cooldown_snapshot()
+        _state["cooldown_until_epoch"] = snap.get("until_epoch")
+        rem = int(float(snap.get("remaining_sec") or 0))
+        _state["banner"] = (
+            f"「Cool-down · {rem}초 남음」 — {reason} · 매수·API·스캔 일시 중단"
+        )
+
+
+def _on_engine_cooldown_exit() -> None:
+    global _last_scan_at
+    _last_scan_at = 0.0
+    set_buy_pause(False, source="cooldown_recovered")
+    _mark_scan_completed("시스템 휴지기 종료, 감시 재시작")
+    with _state_lock:
+        _state.pop("cooldown_active", None)
+        _state.pop("cooldown_reason", None)
+        _state.pop("cooldown_until_epoch", None)
+    _update_engine_mode_from_state()
+    watch = get_recent_watch_hms()
+    with _state_lock:
+        _state["banner"] = build_status_banner_text(watch)
+    _wake_engine()
+
+
+def _maybe_enter_cooldown_if_watch_stale(now_dt: datetime) -> bool:
+    """장중 감시 시각 120초+ 지연 → Hard Refresh 대신 Cool-down 1회 진입."""
+    from engine_cooldown import enter_cooldown, is_cooldown_active
+
+    if is_cooldown_active():
+        return True
     if not _is_weekday():
-        return
+        return False
     now_t = now_dt.time()
     if now_t < SCAN_START or now_t >= SCAN_END:
-        return
+        return False
     stale_sec = float(getattr(config, "WATCH_STALE_HARD_REFRESH_SEC", 120))
     snap = get_watch_time_snapshot()
     epoch = float(snap.get("epoch") or 0)
     if epoch <= 0:
-        return
+        return False
     age = time.time() - epoch
     if age < stale_sec:
+        return False
+    reason = f"감시 시각 {int(age)}초 지연 (>{int(stale_sec)}초)"
+    return enter_cooldown(reason)
+
+
+def _maybe_hard_refresh_if_watch_stale(now_dt: datetime) -> None:
+    """레거시 별칭 — Cool-down 진입으로 대체."""
+    _maybe_enter_cooldown_if_watch_stale(now_dt)
+
+
+def _run_engine_cooldown_sleep() -> None:
+    """Cool-down 중 — 최소 API·로그, 청크 sleep."""
+    from engine_cooldown import (
+        cooldown_snapshot,
+        is_cooldown_active,
+        remaining_sec,
+        sleep_chunk_sec,
+        try_recover_if_due,
+    )
+
+    if try_recover_if_due():
         return
-    _force_engine_hard_refresh(f"감시 시각 {int(age)}초 지연 (>{int(stale_sec)}초)")
+    if not is_cooldown_active():
+        return
+    rem = remaining_sec()
+    snap = cooldown_snapshot()
+    with _state_lock:
+        _state["cooldown_active"] = True
+        _state["cooldown_reason"] = snap.get("reason")
+        _state["cooldown_until_epoch"] = snap.get("until_epoch")
+        _state["banner"] = (
+            f"「Cool-down · {int(rem)}초 남음」 — "
+            f"{snap.get('reason') or '휴지'} · 매수·API·스캔 일시 중단"
+        )
+    _set_engine_mode("cooldown")
+    time.sleep(min(float(sleep_chunk_sec()), max(1.0, rem)))
 
 
 def _refresh_account_snapshot(
@@ -672,6 +751,19 @@ def _refresh_account_snapshot(
     publish_to_state: bool = True,
 ) -> dict[str, Any]:
     global _last_account_refresh_at
+    from engine_cooldown import is_cooldown_active
+
+    if is_cooldown_active() and not force:
+        with _state_lock:
+            cached = dict(_state.get("account_snapshot") or {})
+        if cached:
+            cached = dict(cached)
+            cached["cooldown"] = True
+            cached["stale"] = True
+            cached["message"] = "Cool-down — 잔고 조회 일시 중단"
+            return cached
+        return {"cooldown": True, "stale": True, "message": "Cool-down"}
+
     now = _now_ts()
     with _state_lock:
         cached = dict(_state.get("account_snapshot") or {})
@@ -759,6 +851,10 @@ def _scan_debounce_sec() -> float:
 
 def _should_run_realtime_scan() -> bool:
     """장중 빈 슬롯 — WS 틱·엔진 이벤트 기반 재탐색 (1H 정각 없음)."""
+    from engine_cooldown import is_cooldown_active
+
+    if is_cooldown_active():
+        return False
     if _buy_paused:
         return False
     if _empty_slots() <= 0:
@@ -3327,6 +3423,11 @@ def _enqueue_pick_entry_debug_force(
     디버그 — _enqueue_pick_entry 게이트(MA·bet_quantity 등) 우회 후 주문 큐 강제 적재.
     MANUAL_BUY_DEBUG_FORCE_QUEUE=True 일 때만 사용.
     """
+    from engine_cooldown import is_cooldown_active
+
+    if is_cooldown_active():
+        logger.warning("[MANUAL_BUY_DEBUG] Cool-down — 매수 큐 차단")
+        return None
     from slot_registry import display_idx_for_slot_uid, find_empty_slot_for_mode, slot_spec
     from trading_categories import normalize_trading_category
 
@@ -3452,6 +3553,11 @@ def _enqueue_pick_entry(
     source: str,
     entry_basis: str,
 ) -> dict[str, Any] | None:
+    from engine_cooldown import is_cooldown_active
+
+    if is_cooldown_active():
+        logger.warning("Cool-down — 매수 큐 진입 차단 %s", pick.get("code"))
+        return None
     code = normalize_code(pick.get("code"))
     if len(code) != 6 or _is_code_order_pending(code, {"buy"}):
         return None
@@ -3742,6 +3848,10 @@ def _order_worker_loop() -> None:
 
 
 def _poll_pending_orders_once() -> None:
+    from engine_cooldown import is_cooldown_active
+
+    if is_cooldown_active():
+        return
     with _orders_lock:
         pending = [
             dict(v)
@@ -3853,6 +3963,16 @@ def _run_market_scan_and_buy(*, force: bool = False) -> dict[str, Any]:
             "success": False,
             "skipped": True,
             "message": "신규 매수 일시정지 모드입니다.",
+            "completed_at": completed_at,
+        }
+
+    from engine_cooldown import is_cooldown_active
+
+    if is_cooldown_active():
+        return {
+            "success": False,
+            "skipped": True,
+            "message": "Cool-down 휴지기 — 매수·스캔 일시 중단",
             "completed_at": completed_at,
         }
 
@@ -4383,6 +4503,11 @@ def _process_theme_timeline() -> None:
 
 def _run_realtime_cycle() -> None:
     """장중 1틱 — WS 체결 즉시 판정 · 빈 슬롯 롤링 탐색."""
+    from engine_cooldown import is_cooldown_active
+
+    if is_cooldown_active():
+        return
+
     global _last_monitor_at, _last_scan_at
 
     positions = list(_get_all_positions().values())
@@ -4504,11 +4629,23 @@ def _realtime_engine_loop() -> None:
             continue
 
         try:
-            _maybe_hard_refresh_if_watch_stale(now_dt)
+            from engine_cooldown import is_cooldown_active, try_recover_if_due
+
+            if try_recover_if_due():
+                pass
+            elif is_cooldown_active():
+                _run_engine_cooldown_sleep()
+                continue
+            if _maybe_enter_cooldown_if_watch_stale(now_dt):
+                _run_engine_cooldown_sleep()
+                continue
             _run_realtime_cycle()
         except Exception as exc:
             logger.exception("실시간 엔진 틱 오류: %s", exc)
-            _force_engine_hard_refresh(f"엔진 틱 예외: {exc}")
+            from engine_cooldown import is_cooldown_active
+
+            if not is_cooldown_active():
+                _force_engine_hard_refresh(f"엔진 틱 예외: {exc}")
 
         if ws_ok and not is_polling_strategy_mode():
             _engine_wake.wait(timeout=WS_ENGINE_WAIT_SEC)
@@ -4527,6 +4664,12 @@ def start_background_scheduler() -> None:
     with _start_lock:
         if _started:
             return
+        from engine_cooldown import register_hooks
+
+        register_hooks(
+            on_enter=_on_engine_cooldown_enter,
+            on_exit=_on_engine_cooldown_exit,
+        )
         trade_state.ensure_trade_state_file()
         trade_state.ensure_positions_file()
         _load_positions_from_disk()
@@ -4618,6 +4761,8 @@ def set_buy_pause(paused: bool, *, source: str = "system") -> dict[str, Any]:
 
 
 def get_scheduler_status() -> dict[str, Any]:
+    from engine_cooldown import cooldown_snapshot
+
     with _boot_scan_lock:
         boot_status = _boot_scan_status
     with _state_lock:
@@ -4626,6 +4771,7 @@ def get_scheduler_status() -> dict[str, Any]:
     out["scan_active"] = _scan_active
     out["ws_ready"] = _realtime_ws_ready()
     out["ws_health"] = _ws_health_snapshot()
+    out["cooldown"] = cooldown_snapshot()
     return out
 
 
@@ -4721,6 +4867,15 @@ def handle_manual_buy(
     if not _begin_scan():
         logger.info("[handle_manual_buy] REJECT begin_scan — another scan/order in progress")
         return {"success": False, "message": "다른 스캔/주문이 진행 중입니다."}
+
+    from engine_cooldown import is_cooldown_active
+
+    if is_cooldown_active():
+        logger.info("[handle_manual_buy] REJECT cooldown — 휴지기 중")
+        return {
+            "success": False,
+            "message": "Cool-down 휴지기 중입니다. 잠시 후 다시 시도해 주세요.",
+        }
 
     locked_slot_uid: str | None = None
     try:

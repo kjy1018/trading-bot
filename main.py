@@ -100,6 +100,7 @@ _MODE_LABELS = {
     "scalp_watch": "단타 초단위 감시 + 스윙/장투 보유",
     "monitoring": "보유 슬롯 실시간 감시 (웹소켓 체결가 + REST 보조)",
     "swing_active": "스윙·장투 보유 감시",
+    "cooldown": "Cool-down 휴지기 (매수·API 일시 중단)",
     "off_hours": "장외 · 보유 유지",
 }
 _SLOT_MODE_OPTIONS = ["단타", "스윙", "장투"]
